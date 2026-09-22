@@ -35,6 +35,7 @@ mod peers_pool;
 mod proposer;
 mod round_prober;
 mod round_tracker;
+pub mod snapper;
 mod stake_aggregator;
 pub mod storage;
 mod subscriber;
