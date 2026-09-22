@@ -29,10 +29,13 @@ pub struct SnapperTransactionRef {
 /// A validator's current stance for one unresolved owned-object version.
 ///
 /// `Bottom` is intentionally not split into skip and unlock here. Both are the
-/// same current stance. Snapper classifies a `Bottom` declaration as a skip
-/// vote if the validator never previously ACKed a candidate, and as an unlock
-/// vote if it previously ACKed a candidate. That classification is derived
-/// from DAG history rather than encoded in the vote itself.
+/// same current stance. Snapper classifies a `Bottom` declaration as:
+///
+/// - a skip vote if the validator never previously ACKed a candidate; or
+/// - an unlock vote if the validator previously ACKed a candidate.
+///
+/// That classification must therefore be derived from the validator's DAG
+/// history rather than encoded in the vote itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapperObjectStance {
     Transaction(SnapperTransactionRef),
@@ -41,8 +44,8 @@ pub enum SnapperObjectStance {
 
 /// A stance change recorded in a validator's DAG block.
 ///
-/// A validator emits an entry only when its stance changes. If an object has no
-/// entry in a later block, the previous stance remains in force.
+/// A validator only needs to emit an entry when its stance changes. If an
+/// object has no entry in a later block, the previous stance remains in force.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapperObjectStanceVote {
     pub object: SnapperObjectKey,

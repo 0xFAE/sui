@@ -20,6 +20,7 @@ use crate::{
     context::Context,
     ensure,
     error::{ConsensusError, ConsensusResult},
+    snapper::SnapperObjectStanceVote,
 };
 
 pub(crate) const GENESIS_ROUND: Round = 0;
@@ -81,6 +82,9 @@ pub trait BlockAPI {
 
     /// Votes on if a transaction should be accepted or rejected.
     fn transaction_votes(&self) -> &[BlockTransactionVotes];
+
+    /// Snapper object-level stance changes carried by this block.
+    fn snapper_object_stance_votes(&self) -> &[SnapperObjectStanceVote];
 
     /// Transactions in this blocks' casual history at and before the cutoff round
     /// will not receive accept votes from this block.
@@ -179,6 +183,10 @@ impl BlockAPI for BlockV1 {
         &[]
     }
 
+    fn snapper_object_stance_votes(&self) -> &[SnapperObjectStanceVote] {
+        &[]
+    }
+
     fn transaction_votes_cutoff_round(&self) -> Round {
         panic!("transaction_votes_cutoff_round() is not supported on BlockV1");
     }
@@ -201,6 +209,7 @@ pub(crate) struct BlockV2 {
     ancestors: Vec<BlockRef>,
     transactions: Vec<Transaction>,
     transaction_votes: Vec<BlockTransactionVotes>,
+    snapper_object_stance_votes: Vec<SnapperObjectStanceVote>,
     commit_votes: Vec<CommitVote>,
     misbehavior_reports: Vec<MisbehaviorReport>,
 }
@@ -214,6 +223,7 @@ impl BlockV2 {
         ancestors: Vec<BlockRef>,
         transactions: Vec<Transaction>,
         transaction_votes: Vec<BlockTransactionVotes>,
+        snapper_object_stance_votes: Vec<SnapperObjectStanceVote>,
         commit_votes: Vec<CommitVote>,
         misbehavior_reports: Vec<MisbehaviorReport>,
     ) -> BlockV2 {
@@ -225,6 +235,7 @@ impl BlockV2 {
             ancestors,
             transactions,
             transaction_votes,
+            snapper_object_stance_votes,
             commit_votes,
             misbehavior_reports,
         }
@@ -239,6 +250,7 @@ impl BlockV2 {
             ancestors: vec![],
             transactions: vec![],
             transaction_votes: vec![],
+            snapper_object_stance_votes: vec![],
             commit_votes: vec![],
             misbehavior_reports: vec![],
         }
@@ -280,6 +292,10 @@ impl BlockAPI for BlockV2 {
 
     fn transaction_votes(&self) -> &[BlockTransactionVotes] {
         &self.transaction_votes
+    }
+
+    fn snapper_object_stance_votes(&self) -> &[SnapperObjectStanceVote] {
+        &self.snapper_object_stance_votes
     }
 
     fn transaction_votes_cutoff_round(&self) -> Round {
@@ -388,6 +404,10 @@ impl BlockAPI for BlockV3 {
 
     fn transaction_votes(&self) -> &[BlockTransactionVotes] {
         &self.transaction_votes
+    }
+
+    fn snapper_object_stance_votes(&self) -> &[SnapperObjectStanceVote] {
+        &[]
     }
 
     fn transaction_votes_cutoff_round(&self) -> Round {
@@ -760,6 +780,14 @@ impl TestBlock {
 
     pub(crate) fn set_transaction_votes(mut self, votes: Vec<BlockTransactionVotes>) -> Self {
         self.block.transaction_votes = votes;
+        self
+    }
+
+    pub(crate) fn set_snapper_object_stance_votes(
+        mut self,
+        votes: Vec<SnapperObjectStanceVote>,
+    ) -> Self {
+        self.block.snapper_object_stance_votes = votes;
         self
     }
 

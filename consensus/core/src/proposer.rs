@@ -549,6 +549,7 @@ impl Proposer for ValidatorProposer {
                 ancestors.iter().map(|b| b.reference()).collect(),
                 transactions,
                 transaction_votes,
+                vec![],
                 commit_votes,
                 vec![],
             ))
