@@ -113,6 +113,17 @@ impl CommitObserver {
         }
 
         for commit in committed_sub_dags.iter() {
+            let snapper_decisions = self
+                .transaction_vote_tracker
+                .resolve_snapper_committed_anchor(commit.leader, &commit.blocks);
+            if !snapper_decisions.is_empty() {
+                tracing::debug!(
+                    "Snapper resolved {} owned object version(s) at committed anchor {}",
+                    snapper_decisions.len(),
+                    commit.leader
+                );
+            }
+
             tracing::debug!(
                 "Sending commit {} leader {} to finalization and execution.",
                 commit.commit_ref,
@@ -210,6 +221,12 @@ impl CommitObserver {
 
                 let committed_sub_dag =
                     load_committed_subdag_from_store(self.store.as_ref(), commit);
+
+                self.transaction_vote_tracker
+                    .resolve_snapper_committed_anchor(
+                        committed_sub_dag.leader,
+                        &committed_sub_dag.blocks,
+                    );
 
                 if !committed_sub_dag.recovered_rejected_transactions && !seen_unfinalized_commit {
                     info!(

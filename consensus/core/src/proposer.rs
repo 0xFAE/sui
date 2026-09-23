@@ -525,19 +525,32 @@ impl Proposer for ValidatorProposer {
             .write()
             .take_commit_votes(MAX_COMMIT_VOTES_PER_BLOCK);
 
-        let transaction_votes = if self.context.protocol_config.transaction_voting_enabled() {
-            let new_causal_history = {
-                let mut dag_state = self.dag_state.write();
-                ancestors
-                    .iter()
-                    .flat_map(|ancestor| dag_state.link_causal_history(ancestor.reference()))
-                    .collect()
+        let (transaction_votes, snapper_object_stance_votes) =
+            if self.context.protocol_config.transaction_voting_enabled() {
+                let new_causal_history = {
+                    let mut dag_state = self.dag_state.write();
+                    ancestors
+                        .iter()
+                        .flat_map(|ancestor| dag_state.link_causal_history(ancestor.reference()))
+                        .collect::<Vec<BlockRef>>()
+                };
+                let snapper_object_stance_votes =
+                    self.transaction_vote_tracker.get_snapper_stance_votes(
+                        clock_round,
+                        &ancestors
+                            .iter()
+                            .map(|ancestor| ancestor.reference())
+                            .collect::<Vec<_>>(),
+                        &new_causal_history,
+                        &transactions,
+                    );
+                let transaction_votes = self
+                    .transaction_vote_tracker
+                    .get_own_votes(new_causal_history);
+                (transaction_votes, snapper_object_stance_votes)
+            } else {
+                (vec![], vec![])
             };
-            self.transaction_vote_tracker
-                .get_own_votes(new_causal_history)
-        } else {
-            vec![]
-        };
 
         // Create the block.
         let block = if self.context.protocol_config.transaction_voting_enabled() {
@@ -549,7 +562,7 @@ impl Proposer for ValidatorProposer {
                 ancestors.iter().map(|b| b.reference()).collect(),
                 transactions,
                 transaction_votes,
-                vec![],
+                snapper_object_stance_votes,
                 commit_votes,
                 vec![],
             ))
