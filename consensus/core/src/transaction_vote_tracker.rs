@@ -20,7 +20,8 @@ use crate::{
     dag_state::DagState,
     snapper::{
         SnapperBottomVoteKind, SnapperObjectDecision, SnapperObjectKey, SnapperObjectStance,
-        SnapperObjectStanceVote, SnapperState, SnapperTransactionEnvelope, SnapperTransactionId,
+        SnapperObjectStanceVote, SnapperResolutionObservation, SnapperResolutionPath, SnapperState,
+        SnapperTransactionEnvelope, SnapperTransactionId,
     },
     stake_aggregator::{QuorumThreshold, StakeAggregator},
 };
@@ -210,6 +211,60 @@ impl TransactionVoteTracker {
             .decision(object)
     }
 
+    pub(crate) fn snapper_resolution_observation(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperResolutionObservation> {
+        self.vote_tracker_state
+            .read()
+            .snapper_resolution_observations
+            .get(object)
+            .copied()
+    }
+
+    pub(crate) fn snapper_own_stance(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperObjectStance> {
+        self.vote_tracker_state
+            .read()
+            .snapper_state
+            .own_stance(object)
+    }
+
+    pub(crate) fn snapper_has_transaction_certificate(
+        &self,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        let state = self.vote_tracker_state.read();
+        state
+            .snapper_blocks
+            .keys()
+            .copied()
+            .any(|block_ref| state.snapper_is_fast_cert(block_ref, transaction))
+    }
+
+    /// Evaluation-only: whether the latest block authored by `author`
+    /// has `transaction` certified in its causal history.
+    pub(crate) fn snapper_author_certificate_visible(
+        &self,
+        author: usize,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        let state = self.vote_tracker_state.read();
+
+        let latest = state
+            .snapper_blocks
+            .keys()
+            .copied()
+            .filter(|block_ref| block_ref.author.value() == author)
+            .max_by_key(|block_ref| block_ref.round);
+
+        latest
+            .map(|block_ref| state.snapper_has_cert(block_ref, transaction))
+            .unwrap_or(false)
+    }
+
     /// Retrieves transactions in the block that have received reject votes, and the total stake of the votes.
     /// TransactionIndex not included in the output has no reject votes.
     /// Returns None if no information is found for the block.
@@ -272,6 +327,9 @@ struct VoteTrackerState {
     // Blocks whose Snapper transactions and stance declarations have already
     // been incorporated into snapper_state.
     snapper_processed_blocks: BTreeSet<BlockRef>,
+
+    // First local resolution observation per object. Evaluation-only metadata.
+    snapper_resolution_observations: BTreeMap<SnapperObjectKey, SnapperResolutionObservation>,
 }
 
 impl VoteTrackerState {
@@ -284,6 +342,26 @@ impl VoteTrackerState {
             snapper_state: SnapperState::new(own_authority),
             snapper_blocks: BTreeMap::new(),
             snapper_processed_blocks: BTreeSet::new(),
+            snapper_resolution_observations: BTreeMap::new(),
+        }
+    }
+
+    fn record_snapper_resolutions(
+        &mut self,
+        round: Round,
+        path: SnapperResolutionPath,
+        decisions: &[(SnapperObjectKey, SnapperObjectDecision)],
+    ) {
+        let timestamp_ms = self.context.clock.timestamp_utc_ms();
+        for (object, decision) in decisions {
+            self.snapper_resolution_observations
+                .entry(*object)
+                .or_insert(SnapperResolutionObservation {
+                    decision: *decision,
+                    path,
+                    round,
+                    timestamp_ms,
+                });
         }
     }
 
@@ -746,6 +824,7 @@ impl VoteTrackerState {
 
             for transaction in fast_commits {
                 if let Ok(decisions) = self.snapper_state.commit_transaction(transaction) {
+                    self.record_snapper_resolutions(round, SnapperResolutionPath::Fast, &decisions);
                     changed.extend(decisions);
                 }
             }
@@ -775,6 +854,7 @@ impl VoteTrackerState {
 
             for object in fast_releases {
                 if let Ok(decisions) = self.snapper_state.release_object(object) {
+                    self.record_snapper_resolutions(round, SnapperResolutionPath::Fast, &decisions);
                     changed.extend(decisions);
                 }
             }
@@ -936,6 +1016,11 @@ impl VoteTrackerState {
             }
         }
 
+        self.record_snapper_resolutions(
+            anchor.round,
+            SnapperResolutionPath::CommittedAnchor,
+            &changed,
+        );
         changed
     }
 

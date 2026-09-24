@@ -103,6 +103,24 @@ pub enum SnapperObjectDecision {
     Release,
 }
 
+/// How a Snapper object resolution was reached.
+///
+/// Evaluation metadata only; it is not consumed by the protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapperResolutionPath {
+    Fast,
+    CommittedAnchor,
+}
+
+/// First local observation that an owned-object version has been resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapperResolutionObservation {
+    pub decision: SnapperObjectDecision,
+    pub path: SnapperResolutionPath,
+    pub round: consensus_types::block::Round,
+    pub timestamp_ms: u64,
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SnapperStateError {
     #[error(

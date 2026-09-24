@@ -48,6 +48,8 @@ mod universal_committer;
 /// Consensus test utilities.
 mod commit_test_fixture;
 #[cfg(test)]
+mod evaluation;
+#[cfg(test)]
 mod test_dag;
 mod test_dag_builder;
 #[cfg(test)]

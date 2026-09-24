@@ -19,6 +19,8 @@ pub mod consensus_manager;
 pub mod consensus_throughput_calculator;
 pub(crate) mod consensus_types;
 pub mod consensus_validator;
+#[cfg(test)]
+pub mod cuttlefish;
 pub mod db_checkpoint_handler;
 pub mod epoch;
 pub mod execution_cache;
@@ -60,6 +62,9 @@ pub mod validator_client_monitor;
 mod congestion_control_tests;
 #[path = "unit_tests/consensus_test_utils.rs"]
 pub mod consensus_test_utils;
+#[cfg(test)]
+#[path = "unit_tests/cuttlefish_tests.rs"]
+mod cuttlefish_tests;
 #[cfg(test)]
 #[path = "unit_tests/move_package_publish_tests.rs"]
 mod move_package_publish_tests;

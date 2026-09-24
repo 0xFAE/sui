@@ -21,6 +21,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{convert::TryInto, env};
 use sui_test_transaction_builder::TestTransactionBuilder;
 
@@ -63,13 +64,31 @@ use sui_types::{
 use sui_types::{SUI_CLOCK_OBJECT_SHARED_VERSION, digests::Digest};
 use sui_types::{dynamic_field::DynamicFieldType, messages_consensus::ConsensusTransaction};
 
+use crate::authority::authority_per_epoch_store::consensus_quarantine::ConsensusCommitOutput;
+use consensus_config::{ConsensusProtocolConfig, Parameters, local_committee_and_keys};
+use consensus_core::{
+    Clock, CommitConsumerArgs, ConsensusAuthority, NetworkType, TransactionVerifier,
+    ValidationError,
+    snapper::{
+        SnapperObjectDecision, SnapperObjectKey, SnapperObjectStance, SnapperResolutionObservation,
+        SnapperResolutionPath, SnapperTransactionEnvelope,
+    },
+};
+use consensus_types::block::{
+    BlockRef as ConsensusBlockRef, TransactionIndex as ConsensusTransactionIndex,
+};
+use mysten_metrics::RegistryService;
+use prometheus::Registry;
+use tempfile::TempDir;
+use typed_store::DBMetrics;
+
 use crate::authority::shared_object_congestion_tracker::SharedObjectCongestionTracker;
 use crate::authority::test_authority_builder::TestAuthorityBuilder;
 use crate::authority::transaction_deferral::DeferralKey;
 use crate::checkpoints::CheckpointServiceNotify;
 use crate::consensus_handler::ConsensusHandler;
 use crate::consensus_test_utils;
-use crate::test_utils::init_state_parameters_from_rng;
+use crate::test_utils::{init_state_parameters_from_rng, make_transfer_object_transaction};
 use crate::transaction_input_loader::TransactionInputLoader;
 use crate::{
     authority::authority_store_tables::AuthorityPerpetualTables,
@@ -6433,6 +6452,1040 @@ async fn test_consensus_handler_congestion_control_transaction_cancellation() {
                         ]
             }));
         }
+    }
+}
+
+fn eval_unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after Unix epoch")
+        .as_millis() as u64
+}
+
+/// Evaluation-only Mysticeti-FPC epoch-boundary lock-lifetime smoke test.
+///
+/// This test exercises the actual Sui per-epoch owned-object lock store:
+/// 1. tx0 acquires the owned-object lock in epoch E;
+/// 2. a conflicting tx1 is blocked while E is still active;
+/// 3. the authority reconfigures to E+1;
+/// 4. the old per-epoch lock is absent and a fresh tx2 can acquire the same
+///    owned-object version.
+///
+/// The short sleep models "remaining time in the epoch" only for this smoke
+/// test. Final paper experiments should drive a real configured epoch timer.
+#[tokio::test]
+#[ignore = "evaluation-only Mysticeti-FPC epoch unlock baseline"]
+async fn mysticeti_fpc_epoch_unlock_smoke() {
+    telemetry_subscribers::init_for_testing();
+
+    let smoke_remaining_epoch_ms = std::env::var("SUI_EVAL_REMAINING_EPOCH_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(250);
+
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+
+    // One real owned object plus three independent gas objects. The gas objects
+    // are distinct so the intentional conflict is the target object's exact
+    // version.
+    let target_object = Object::with_id_owner_for_testing(ObjectID::random(), sender);
+    let gas_objects = create_gas_objects(3, sender);
+
+    let target_ref = target_object.compute_object_reference();
+    let gas_refs = gas_objects
+        .iter()
+        .map(|object| object.compute_object_reference())
+        .collect::<Vec<_>>();
+
+    let mut starting_objects = vec![target_object.clone()];
+    starting_objects.extend(gas_objects.iter().cloned());
+
+    let authority = TestAuthorityBuilder::new()
+        .with_starting_objects(&starting_objects)
+        .build()
+        .await;
+
+    let rgp = authority.reference_gas_price_for_testing().unwrap();
+
+    let tx0 = make_transfer_object_transaction(
+        target_ref,
+        gas_refs[0],
+        sender,
+        &sender_key,
+        dbg_addr(2),
+        rgp,
+    );
+    let tx1 = make_transfer_object_transaction(
+        target_ref,
+        gas_refs[1],
+        sender,
+        &sender_key,
+        dbg_addr(3),
+        rgp,
+    );
+    let tx2 = make_transfer_object_transaction(
+        target_ref,
+        gas_refs[2],
+        sender,
+        &sender_key,
+        dbg_addr(4),
+        rgp,
+    );
+
+    // Before the post-consensus lock is installed, both conflicting
+    // transactions are individually valid.
+    handle_transaction_for_test(&authority, tx0.clone())
+        .expect("tx0 should be valid before lock acquisition");
+    handle_transaction_for_test(&authority, tx1.clone())
+        .expect("tx1 should be valid before lock acquisition");
+
+    let epoch0_store = authority.epoch_store_for_testing();
+    let epoch0 = epoch0_store.epoch();
+
+    // Exercise the same post-consensus lock API used by ConsensusHandler.
+    let tx0_inputs = vec![target_ref, gas_refs[0]];
+    let tx0_locks = epoch0_store
+        .try_acquire_owned_object_locks_post_consensus(&tx0_inputs, *tx0.digest(), &HashMap::new())
+        .expect("tx0 should acquire its owned-object locks");
+
+    // Stage those locks in the real consensus quarantine. Subsequent lookups
+    // therefore observe the same per-epoch lock state as consensus processing.
+    let mut output = ConsensusCommitOutput::new(1);
+    output.set_default_commit_stats_for_testing();
+    output.set_owned_object_locks(tx0_locks.into_iter().collect());
+    epoch0_store
+        .consensus_quarantine
+        .write()
+        .push_consensus_output(output, &epoch0_store)
+        .expect("staging tx0 locks in consensus quarantine should succeed");
+
+    let target_lock = epoch0_store
+        .get_owned_object_locks(&[target_ref])
+        .expect("lock lookup should succeed")[0];
+    assert_eq!(
+        target_lock,
+        Some(*tx0.digest()),
+        "tx0 should hold the target object lock in epoch {epoch0}"
+    );
+
+    // Inject a conflicting transaction. It cannot acquire the object while the
+    // epoch-E lock remains present.
+    let conflict_injected_at_ms = eval_unix_time_ms();
+    let tx1_inputs = vec![target_ref, gas_refs[1]];
+    let conflict_result = epoch0_store.try_acquire_owned_object_locks_post_consensus(
+        &tx1_inputs,
+        *tx1.digest(),
+        &HashMap::new(),
+    );
+    assert!(
+        conflict_result.is_err(),
+        "conflicting tx1 unexpectedly acquired the epoch-{epoch0} object lock"
+    );
+
+    // Waiting inside the same epoch does not clear the lock.
+    tokio::time::sleep(Duration::from_millis(smoke_remaining_epoch_ms)).await;
+    let target_lock_after_wait = epoch0_store
+        .get_owned_object_locks(&[target_ref])
+        .expect("lock lookup after wait should succeed")[0];
+    assert_eq!(
+        target_lock_after_wait,
+        Some(*tx0.digest()),
+        "owned-object lock should survive while the same epoch is active"
+    );
+
+    let epoch_transition_started_at_ms = eval_unix_time_ms();
+    authority.reconfigure_for_testing().await;
+
+    let epoch1_store = authority.epoch_store_for_testing();
+    let epoch1 = epoch1_store.epoch();
+    assert_eq!(epoch1, epoch0 + 1);
+
+    // The lock table is per-epoch, so tx0's stale lock is not present in E+1.
+    let post_reconfig_lock = epoch1_store
+        .get_owned_object_locks(&[target_ref])
+        .expect("new-epoch lock lookup should succeed")[0];
+    assert!(
+        post_reconfig_lock.is_none(),
+        "epoch-{epoch0} object lock leaked into epoch {epoch1}"
+    );
+
+    // A fresh transaction using that same object version is now admissible and
+    // can acquire the new epoch's lock.
+    handle_transaction_for_test(&authority, tx2.clone())
+        .expect("fresh transaction should validate after epoch change");
+
+    let tx2_inputs = vec![target_ref, gas_refs[2]];
+    let tx2_locks = epoch1_store
+        .try_acquire_owned_object_locks_post_consensus(&tx2_inputs, *tx2.digest(), &HashMap::new())
+        .expect("fresh transaction should acquire the object after epoch change");
+    assert!(
+        tx2_locks
+            .iter()
+            .any(|(object_ref, _)| *object_ref == target_ref),
+        "fresh transaction did not acquire the target object lock"
+    );
+
+    let object_usable_at_ms = eval_unix_time_ms();
+
+    println!();
+    println!("=== Mysticeti-FPC epoch unlock baseline ===");
+    println!("object={target_ref:?}");
+    println!("locking_tx={:?}", tx0.digest());
+    println!("conflicting_tx={:?}", tx1.digest());
+    println!("fresh_tx={:?}", tx2.digest());
+    println!("epoch_before={epoch0}");
+    println!("epoch_after={epoch1}");
+    println!("smoke_remaining_epoch_ms={smoke_remaining_epoch_ms}");
+    println!("conflict_injected_at_ms={conflict_injected_at_ms}");
+    println!("epoch_transition_started_at_ms={epoch_transition_started_at_ms}");
+    println!("object_usable_at_ms={object_usable_at_ms}");
+    println!(
+        "conflict_to_object_usable_ms={}",
+        object_usable_at_ms.saturating_sub(conflict_injected_at_ms)
+    );
+    println!(
+        "reconfiguration_ms={}",
+        object_usable_at_ms.saturating_sub(epoch_transition_started_at_ms)
+    );
+    println!();
+}
+
+struct SnapperEvalNoopVerifier;
+
+impl TransactionVerifier for SnapperEvalNoopVerifier {
+    fn verify_batch(&self, _batch: &[&[u8]]) -> Result<(), ValidationError> {
+        Ok(())
+    }
+
+    fn verify_and_vote_batch(
+        &self,
+        _block_ref: &ConsensusBlockRef,
+        _batch: &[&[u8]],
+    ) -> Result<Vec<ConsensusTransactionIndex>, ValidationError> {
+        Ok(vec![])
+    }
+}
+
+async fn wait_for_snapper_resolution_any(
+    authorities: &[ConsensusAuthority],
+    object: SnapperObjectKey,
+    timeout: Duration,
+) -> Vec<SnapperResolutionObservation> {
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let observations = authorities
+            .iter()
+            .map(|authority| authority.snapper_resolution_observation(&object))
+            .collect::<Vec<_>>();
+
+        if observations.iter().all(Option::is_some) {
+            return observations
+                .into_iter()
+                .map(Option::unwrap)
+                .collect::<Vec<_>>();
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for Snapper resolution of {object:?}; current={observations:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_snapper_ack_precondition(
+    authorities: &[ConsensusAuthority],
+    object: SnapperObjectKey,
+    transaction: consensus_core::snapper::SnapperTransactionId,
+    required_acks: usize,
+    timeout: Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let ack_count = authorities
+            .iter()
+            .filter(|authority| {
+                authority.snapper_own_stance(&object)
+                    == Some(SnapperObjectStance::Transaction(transaction))
+            })
+            .count();
+
+        let has_certificate = authorities
+            .iter()
+            .any(|authority| authority.snapper_has_transaction_certificate(transaction));
+
+        if ack_count >= required_acks && !has_certificate {
+            return;
+        }
+
+        assert!(
+            !has_certificate,
+            "post-ACK precondition missed: tx certificate formed before conflict injection"
+        );
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {required_acks} pre-conflict ACKs; current ACK count={ack_count}"
+        );
+
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_hidden_certificate_precondition(
+    authorities: &[ConsensusAuthority],
+    object: SnapperObjectKey,
+    transaction: consensus_core::snapper::SnapperTransactionId,
+    timeout: Duration,
+) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let certificate_exists = authorities
+            .iter()
+            .any(|authority| authority.snapper_has_transaction_certificate(transaction));
+
+        let already_resolved = authorities
+            .iter()
+            .any(|authority| authority.snapper_resolution_observation(&object).is_some());
+
+        if certificate_exists && !already_resolved {
+            if let Some(hidden_authority) = (0..authorities.len()).find(|author| {
+                !authorities[*author].snapper_author_certificate_visible(*author, transaction)
+            }) {
+                return hidden_authority;
+            }
+        }
+
+        assert!(
+            !already_resolved,
+            "hidden-certificate precondition missed: object resolved before a certificate existed on one branch and remained hidden from another"
+        );
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a certificate that is hidden from a conflicting branch"
+        );
+
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_snapper_release(
+    authorities: &[ConsensusAuthority],
+    object: SnapperObjectKey,
+    timeout: Duration,
+) -> Vec<SnapperResolutionObservation> {
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let observations = authorities
+            .iter()
+            .map(|authority| authority.snapper_resolution_observation(&object))
+            .collect::<Vec<_>>();
+
+        if observations.iter().all(Option::is_some) {
+            let observations = observations
+                .into_iter()
+                .map(Option::unwrap)
+                .collect::<Vec<_>>();
+
+            assert!(
+                observations
+                    .iter()
+                    .all(|observation| observation.decision == SnapperObjectDecision::Release),
+                "Step 5D requires the no-certificate release workload; got {observations:#?}"
+            );
+            return observations;
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for Snapper release of {object:?}; current={observations:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Cross-layer Snapper unlock smoke test.
+///
+/// Four real Mysticeti authorities run the Snapper 3f+1 logic. A separate real
+/// Sui AuthorityPerEpochStore holds an owned-object lock for the same object
+/// version. We inject a 2-vs-2 conflicting Snapper workload so neither
+/// transaction can collect a 3-of-4 fast certificate. Once all authorities
+/// decide Release, the evaluation bridge removes that exact lock from the Sui
+/// per-epoch lock store and verifies that a fresh signed Sui transaction can
+/// acquire the same object version without an epoch change.
+#[tokio::test]
+#[ignore = "evaluation-only cross-layer Snapper unlock test"]
+async fn snapper_end_to_end_unlock_smoke() {
+    telemetry_subscribers::init_for_testing();
+    let db_registry = Registry::new();
+    DBMetrics::init(RegistryService::new(db_registry));
+
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+    let target_object = Object::with_id_owner_for_testing(ObjectID::random(), sender);
+    let gas_objects = create_gas_objects(2, sender);
+
+    let target_ref = target_object.compute_object_reference();
+    let gas_refs = gas_objects
+        .iter()
+        .map(|object| object.compute_object_reference())
+        .collect::<Vec<_>>();
+
+    let mut starting_objects = vec![target_object.clone()];
+    starting_objects.extend(gas_objects.iter().cloned());
+
+    let sui_authority = TestAuthorityBuilder::new()
+        .with_starting_objects(&starting_objects)
+        .build()
+        .await;
+    let epoch_store = sui_authority.epoch_store_for_testing();
+    let epoch = epoch_store.epoch();
+    let rgp = sui_authority.reference_gas_price_for_testing().unwrap();
+
+    let locking_tx = make_transfer_object_transaction(
+        target_ref,
+        gas_refs[0],
+        sender,
+        &sender_key,
+        dbg_addr(5),
+        rgp,
+    );
+    handle_transaction_for_test(&sui_authority, locking_tx.clone())
+        .expect("locking transaction should be valid");
+
+    let locking_inputs = vec![target_ref, gas_refs[0]];
+    let initial_locks = epoch_store
+        .try_acquire_owned_object_locks_post_consensus(
+            &locking_inputs,
+            *locking_tx.digest(),
+            &HashMap::new(),
+        )
+        .expect("locking transaction should acquire owned-object locks");
+
+    let mut output = ConsensusCommitOutput::new(1);
+    output.set_default_commit_stats_for_testing();
+    output.set_owned_object_locks(initial_locks.into_iter().collect());
+    epoch_store
+        .consensus_quarantine
+        .write()
+        .push_consensus_output(output, &epoch_store)
+        .expect("staging initial lock should succeed");
+
+    assert_eq!(
+        epoch_store
+            .get_owned_object_locks(&[target_ref])
+            .expect("lock lookup should succeed")[0],
+        Some(*locking_tx.digest()),
+    );
+
+    const AUTHORITIES: usize = 4;
+    let (committee, keypairs) = local_committee_and_keys(0, vec![1; AUTHORITIES]);
+    let protocol_config = ConsensusProtocolConfig::for_testing();
+    assert!(protocol_config.transaction_voting_enabled());
+
+    let consensus_dirs = (0..AUTHORITIES)
+        .map(|_| TempDir::new().unwrap())
+        .collect::<Vec<_>>();
+    let mut authorities = Vec::with_capacity(AUTHORITIES);
+    let mut _commit_receivers = Vec::with_capacity(AUTHORITIES);
+
+    for (index, _) in committee.authorities() {
+        let parameters = Parameters {
+            db_path: consensus_dirs[index.value()].path().to_path_buf(),
+            dag_state_cached_rounds: 5,
+            commit_sync_parallel_fetches: 2,
+            commit_sync_batch_size: 3,
+            sync_last_known_own_block_timeout: Duration::from_millis(2_000),
+            ..Default::default()
+        };
+
+        let (commit_consumer, commit_receiver) = CommitConsumerArgs::new(0, 0);
+        let authority = ConsensusAuthority::start(
+            NetworkType::Tonic,
+            0,
+            committee.clone(),
+            parameters,
+            protocol_config.clone(),
+            Some(keypairs[index].1.clone()),
+            keypairs[index].0.clone(),
+            Arc::new(Clock::default()),
+            Arc::new(SnapperEvalNoopVerifier),
+            commit_consumer,
+            Registry::new(),
+            0,
+            None,
+        )
+        .await;
+
+        authorities.push(authority);
+        _commit_receivers.push(commit_receiver);
+    }
+
+    let snapper_object = SnapperObjectKey {
+        object_id: target_ref.0.into_bytes(),
+        version: target_ref.1.value(),
+    };
+
+    let tx_a = SnapperTransactionEnvelope::new(vec![snapper_object], vec![0xA1; 256]).encode();
+    let tx_b = SnapperTransactionEnvelope::new(vec![snapper_object], vec![0xB2; 256]).encode();
+
+    let conflict_injected_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after Unix epoch")
+        .as_millis() as u64;
+
+    let c0 = authorities[0].transaction_client();
+    let c1 = authorities[1].transaction_client();
+    let c2 = authorities[2].transaction_client();
+    let c3 = authorities[3].transaction_client();
+
+    let (r0, r1, r2, r3) = tokio::join!(
+        c0.submit(vec![tx_a.clone()]),
+        c1.submit(vec![tx_a]),
+        c2.submit(vec![tx_b.clone()]),
+        c3.submit(vec![tx_b]),
+    );
+
+    r0.expect("authority 0 should include tx_a");
+    r1.expect("authority 1 should include tx_a");
+    r2.expect("authority 2 should include tx_b");
+    r3.expect("authority 3 should include tx_b");
+
+    let observations =
+        wait_for_snapper_release(&authorities, snapper_object, Duration::from_secs(30)).await;
+
+    let release_observed_at_ms = observations
+        .iter()
+        .map(|observation| observation.timestamp_ms)
+        .max()
+        .expect("there are four release observations");
+
+    epoch_store
+        .release_owned_object_locks_for_testing(&[target_ref])
+        .expect("Snapper release should clear the Sui owned-object lock");
+
+    assert!(
+        epoch_store
+            .get_owned_object_locks(&[target_ref])
+            .expect("post-release lock lookup should succeed")[0]
+            .is_none(),
+        "target object remained locked after Snapper Release"
+    );
+
+    let fresh_tx = make_transfer_object_transaction(
+        target_ref,
+        gas_refs[1],
+        sender,
+        &sender_key,
+        dbg_addr(6),
+        rgp,
+    );
+    handle_transaction_for_test(&sui_authority, fresh_tx.clone())
+        .expect("fresh transaction should validate after Snapper release");
+
+    let fresh_inputs = vec![target_ref, gas_refs[1]];
+    let fresh_locks = epoch_store
+        .try_acquire_owned_object_locks_post_consensus(
+            &fresh_inputs,
+            *fresh_tx.digest(),
+            &HashMap::new(),
+        )
+        .expect("fresh transaction should acquire the same object in the same epoch");
+
+    assert!(
+        fresh_locks
+            .iter()
+            .any(|(object_ref, _)| *object_ref == target_ref),
+        "fresh transaction did not acquire the released target object"
+    );
+
+    let object_usable_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must be after Unix epoch")
+        .as_millis() as u64;
+
+    println!();
+    println!("=== Snapper end-to-end object unlock ===");
+    println!("epoch={epoch}");
+    println!("object={target_ref:?}");
+    println!("locking_tx={:?}", locking_tx.digest());
+    println!("fresh_tx={:?}", fresh_tx.digest());
+    println!("conflict_injected_at_ms={conflict_injected_at_ms}");
+    println!("release_observed_at_ms={release_observed_at_ms}");
+    println!("object_usable_at_ms={object_usable_at_ms}");
+    println!(
+        "conflict_to_release_ms={}",
+        release_observed_at_ms.saturating_sub(conflict_injected_at_ms)
+    );
+    println!(
+        "release_to_object_usable_ms={}",
+        object_usable_at_ms.saturating_sub(release_observed_at_ms)
+    );
+    println!(
+        "conflict_to_object_usable_ms={}",
+        object_usable_at_ms.saturating_sub(conflict_injected_at_ms)
+    );
+    println!(
+        "max_resolution_round={}",
+        observations
+            .iter()
+            .map(|observation| observation.round)
+            .max()
+            .unwrap()
+    );
+    println!();
+
+    for authority in authorities {
+        authority.stop().await;
+    }
+}
+
+/// End-to-end Snapper object-recovery scenarios used for the unlock figure.
+///
+/// Select with:
+///   SNAPPER_UNLOCK_SCENARIO=fast_skip
+///   SNAPPER_UNLOCK_SCENARIO=no_certificate
+///   SNAPPER_UNLOCK_SCENARIO=post_ack
+///   SNAPPER_UNLOCK_SCENARIO=hidden_certificate
+///
+/// The measured endpoint is conflict injection until a fresh Sui transaction
+/// can acquire the owned object again. The lock-layer handoff is evaluation
+/// only; this test does not change production object-lock integration.
+#[tokio::test]
+#[ignore = "evaluation-only three-scenario Snapper object recovery benchmark"]
+async fn snapper_unlock_scenario_smoke() {
+    telemetry_subscribers::init_for_testing();
+    let db_registry = Registry::new();
+    DBMetrics::init(RegistryService::new(db_registry));
+
+    let scenario =
+        std::env::var("SNAPPER_UNLOCK_SCENARIO").unwrap_or_else(|_| "no_certificate".to_string());
+
+    assert!(
+        matches!(
+            scenario.as_str(),
+            "fast_skip" | "no_certificate" | "post_ack" | "hidden_certificate"
+        ),
+        "unsupported SNAPPER_UNLOCK_SCENARIO={scenario}"
+    );
+
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
+
+    let target_object = Object::with_id_owner_for_testing(ObjectID::random(), sender);
+    let gas_objects = create_gas_objects(2, sender);
+
+    let target_ref = target_object.compute_object_reference();
+    let gas_refs = gas_objects
+        .iter()
+        .map(|object| object.compute_object_reference())
+        .collect::<Vec<_>>();
+
+    let mut starting_objects = vec![target_object.clone()];
+    starting_objects.extend(gas_objects.iter().cloned());
+
+    let sui_authority = TestAuthorityBuilder::new()
+        .with_starting_objects(&starting_objects)
+        .build()
+        .await;
+
+    let epoch_store = sui_authority.epoch_store_for_testing();
+    let rgp = sui_authority.reference_gas_price_for_testing().unwrap();
+
+    let locking_tx = make_transfer_object_transaction(
+        target_ref,
+        gas_refs[0],
+        sender,
+        &sender_key,
+        dbg_addr(20),
+        rgp,
+    );
+
+    handle_transaction_for_test(&sui_authority, locking_tx.clone())
+        .expect("locking transaction should be valid");
+
+    let locking_inputs = vec![target_ref, gas_refs[0]];
+
+    let initial_locks = epoch_store
+        .try_acquire_owned_object_locks_post_consensus(
+            &locking_inputs,
+            *locking_tx.digest(),
+            &HashMap::new(),
+        )
+        .expect("locking transaction should acquire owned-object locks");
+
+    let mut output = ConsensusCommitOutput::new(1);
+    output.set_default_commit_stats_for_testing();
+    output.set_owned_object_locks(initial_locks.into_iter().collect());
+
+    epoch_store
+        .consensus_quarantine
+        .write()
+        .push_consensus_output(output, &epoch_store)
+        .expect("staging initial lock should succeed");
+
+    assert_eq!(
+        epoch_store
+            .get_owned_object_locks(&[target_ref])
+            .expect("lock lookup should succeed")[0],
+        Some(*locking_tx.digest()),
+    );
+
+    const AUTHORITIES: usize = 4;
+
+    let (committee, keypairs) = local_committee_and_keys(0, vec![1; AUTHORITIES]);
+
+    let protocol_config = ConsensusProtocolConfig::for_testing();
+    assert!(protocol_config.transaction_voting_enabled());
+
+    let consensus_dirs = (0..AUTHORITIES)
+        .map(|_| TempDir::new().unwrap())
+        .collect::<Vec<_>>();
+
+    let mut authorities = Vec::with_capacity(AUTHORITIES);
+    let mut _commit_receivers = Vec::with_capacity(AUTHORITIES);
+
+    for (index, _) in committee.authorities() {
+        let parameters = Parameters {
+            db_path: consensus_dirs[index.value()].path().to_path_buf(),
+            dag_state_cached_rounds: 5,
+            commit_sync_parallel_fetches: 2,
+            commit_sync_batch_size: 3,
+            sync_last_known_own_block_timeout: Duration::from_millis(2_000),
+            ..Default::default()
+        };
+
+        let (commit_consumer, commit_receiver) = CommitConsumerArgs::new(0, 0);
+
+        let authority = ConsensusAuthority::start(
+            NetworkType::Tonic,
+            0,
+            committee.clone(),
+            parameters,
+            protocol_config.clone(),
+            Some(keypairs[index].1.clone()),
+            keypairs[index].0.clone(),
+            Arc::new(Clock::default()),
+            Arc::new(SnapperEvalNoopVerifier),
+            commit_consumer,
+            Registry::new(),
+            0,
+            None,
+        )
+        .await;
+
+        authorities.push(authority);
+        _commit_receivers.push(commit_receiver);
+    }
+
+    let snapper_object = SnapperObjectKey {
+        object_id: target_ref.0.into_bytes(),
+        version: target_ref.1.value(),
+    };
+
+    let tx_a_bytes =
+        SnapperTransactionEnvelope::new(vec![snapper_object], vec![0xA7; 256]).encode();
+
+    let tx_b_bytes =
+        SnapperTransactionEnvelope::new(vec![snapper_object], vec![0xB8; 256]).encode();
+
+    let tx_a_id = SnapperTransactionEnvelope::transaction_id(&tx_a_bytes);
+    let tx_b_id = SnapperTransactionEnvelope::transaction_id(&tx_b_bytes);
+
+    let conflict_injected_at_ms: u64;
+    let mut hidden_split_observed = false;
+
+    match scenario.as_str() {
+        "fast_skip" => {
+            // Both conflicting candidates are delivered in one bundle to every
+            // validator. The proposer records both candidates before CastVotes,
+            // so the object is already in recovery while own_stance == None.
+            // Therefore the transition is none -> Bottom, i.e. a Skip vote.
+            conflict_injected_at_ms = eval_unix_time_ms();
+
+            let c0 = authorities[0].transaction_client();
+            let c1 = authorities[1].transaction_client();
+            let c2 = authorities[2].transaction_client();
+            let c3 = authorities[3].transaction_client();
+
+            let (r0, r1, r2, r3) = tokio::join!(
+                c0.submit(vec![tx_a_bytes.clone(), tx_b_bytes.clone()]),
+                c1.submit(vec![tx_a_bytes.clone(), tx_b_bytes.clone()]),
+                c2.submit(vec![tx_a_bytes.clone(), tx_b_bytes.clone()]),
+                c3.submit(vec![tx_a_bytes.clone(), tx_b_bytes.clone()]),
+            );
+
+            r0.expect("authority 0 should include bundled conflicting candidates");
+            r1.expect("authority 1 should include bundled conflicting candidates");
+            r2.expect("authority 2 should include bundled conflicting candidates");
+            r3.expect("authority 3 should include bundled conflicting candidates");
+        }
+
+        "no_certificate" => {
+            conflict_injected_at_ms = eval_unix_time_ms();
+
+            let c0 = authorities[0].transaction_client();
+            let c1 = authorities[1].transaction_client();
+            let c2 = authorities[2].transaction_client();
+            let c3 = authorities[3].transaction_client();
+
+            let (r0, r1, r2, r3) = tokio::join!(
+                c0.submit(vec![tx_a_bytes.clone()]),
+                c1.submit(vec![tx_a_bytes.clone()]),
+                c2.submit(vec![tx_b_bytes.clone()]),
+                c3.submit(vec![tx_b_bytes.clone()]),
+            );
+
+            r0.expect("authority 0 should include tx_a");
+            r1.expect("authority 1 should include tx_a");
+            r2.expect("authority 2 should include tx_b");
+            r3.expect("authority 3 should include tx_b");
+        }
+
+        "post_ack" => {
+            let c0 = authorities[0].transaction_client();
+            let c1 = authorities[1].transaction_client();
+
+            let (r0, r1) = tokio::join!(
+                c0.submit(vec![tx_a_bytes.clone()]),
+                c1.submit(vec![tx_a_bytes.clone()]),
+            );
+
+            r0.expect("authority 0 should include tx_a");
+            r1.expect("authority 1 should include tx_a");
+
+            wait_for_snapper_ack_precondition(
+                &authorities,
+                snapper_object,
+                tx_a_id,
+                2,
+                Duration::from_secs(10),
+            )
+            .await;
+
+            conflict_injected_at_ms = eval_unix_time_ms();
+
+            let c2 = authorities[2].transaction_client();
+            let c3 = authorities[3].transaction_client();
+
+            let (r2, r3) = tokio::join!(
+                c2.submit(vec![tx_b_bytes.clone()]),
+                c3.submit(vec![tx_b_bytes.clone()]),
+            );
+
+            r2.expect("authority 2 should include tx_b");
+            r3.expect("authority 3 should include tx_b");
+        }
+
+        "hidden_certificate" => {
+            let c0 = authorities[0].transaction_client();
+            let c1 = authorities[1].transaction_client();
+            let c2 = authorities[2].transaction_client();
+
+            let hidden_injection = async {
+                let hidden_authority = wait_for_hidden_certificate_precondition(
+                    &authorities,
+                    snapper_object,
+                    tx_a_id,
+                    Duration::from_secs(10),
+                )
+                .await;
+
+                let injected_at_ms = eval_unix_time_ms();
+
+                authorities[hidden_authority]
+                    .transaction_client()
+                    .submit(vec![tx_b_bytes.clone()])
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("hidden authority {hidden_authority} should include tx_b: {error}")
+                    });
+
+                injected_at_ms
+            };
+
+            let (r0, r1, r2, injected_at_ms) = tokio::join!(
+                c0.submit(vec![tx_a_bytes.clone()]),
+                c1.submit(vec![tx_a_bytes.clone()]),
+                c2.submit(vec![tx_a_bytes.clone()]),
+                hidden_injection,
+            );
+
+            r0.expect("authority 0 should include tx_a");
+            r1.expect("authority 1 should include tx_a");
+            r2.expect("authority 2 should include tx_a");
+
+            hidden_split_observed = true;
+            conflict_injected_at_ms = injected_at_ms;
+        }
+
+        _ => unreachable!(),
+    }
+
+    let observations =
+        wait_for_snapper_resolution_any(&authorities, snapper_object, Duration::from_secs(30))
+            .await;
+
+    let decision = observations[0].decision;
+
+    assert!(
+        observations
+            .iter()
+            .all(|observation| observation.decision == decision),
+        "Snapper validators disagreed on object resolution: {observations:#?}"
+    );
+
+    let fast_count = observations
+        .iter()
+        .filter(|observation| observation.path == SnapperResolutionPath::Fast)
+        .count();
+
+    let anchor_count = observations
+        .iter()
+        .filter(|observation| observation.path == SnapperResolutionPath::CommittedAnchor)
+        .count();
+
+    let decision_release = usize::from(decision == SnapperObjectDecision::Release);
+
+    let decision_commit_a = usize::from(decision == SnapperObjectDecision::Commit(tx_a_id));
+
+    let tx_a_certificate_seen = authorities
+        .iter()
+        .any(|authority| authority.snapper_has_transaction_certificate(tx_a_id));
+
+    let tx_b_certificate_seen = authorities
+        .iter()
+        .any(|authority| authority.snapper_has_transaction_certificate(tx_b_id));
+
+    let scenario_valid = match scenario.as_str() {
+        "fast_skip" => {
+            decision_release == 1
+                && fast_count == AUTHORITIES
+                && anchor_count == 0
+                && !tx_a_certificate_seen
+                && !tx_b_certificate_seen
+        }
+
+        "no_certificate" => {
+            decision_release == 1 && !tx_a_certificate_seen && !tx_b_certificate_seen
+        }
+
+        "post_ack" => decision_release == 1 && anchor_count > 0,
+
+        "hidden_certificate" => hidden_split_observed && decision_commit_a == 1 && anchor_count > 0,
+
+        _ => false,
+    };
+
+    if scenario == "fast_skip" {
+        assert_eq!(
+            decision,
+            SnapperObjectDecision::Release,
+            "fast_skip must release the object"
+        );
+        assert_eq!(
+            fast_count, AUTHORITIES,
+            "fast_skip must be observed through SnapperResolutionPath::Fast at every validator; observations={observations:#?}"
+        );
+        assert_eq!(
+            anchor_count, 0,
+            "fast_skip unexpectedly used committed-anchor recovery; observations={observations:#?}"
+        );
+        assert!(
+            !tx_a_certificate_seen && !tx_b_certificate_seen,
+            "fast_skip formed a transaction certificate unexpectedly"
+        );
+    }
+
+    let resolution_observed_at_ms = observations
+        .iter()
+        .map(|observation| observation.timestamp_ms)
+        .max()
+        .unwrap();
+
+    epoch_store
+        .release_owned_object_locks_for_testing(&[target_ref])
+        .expect("resolved Snapper object should clear evaluation lock");
+
+    let fresh_tx = make_transfer_object_transaction(
+        target_ref,
+        gas_refs[1],
+        sender,
+        &sender_key,
+        dbg_addr(21),
+        rgp,
+    );
+
+    handle_transaction_for_test(&sui_authority, fresh_tx.clone())
+        .expect("fresh transaction should validate after Snapper resolution");
+
+    let fresh_inputs = vec![target_ref, gas_refs[1]];
+
+    let fresh_locks = epoch_store
+        .try_acquire_owned_object_locks_post_consensus(
+            &fresh_inputs,
+            *fresh_tx.digest(),
+            &HashMap::new(),
+        )
+        .expect("fresh transaction should acquire resolved object");
+
+    assert!(
+        fresh_locks
+            .iter()
+            .any(|(object_ref, _)| *object_ref == target_ref),
+        "fresh transaction did not acquire the target object"
+    );
+
+    let object_usable_at_ms = eval_unix_time_ms();
+
+    println!();
+    println!("=== Snapper unlock scenario ===");
+    println!("scenario={scenario}");
+    println!("scenario_valid={}", usize::from(scenario_valid));
+    println!(
+        "hidden_split_observed={}",
+        usize::from(hidden_split_observed)
+    );
+    println!(
+        "tx_a_certificate_seen={}",
+        usize::from(tx_a_certificate_seen)
+    );
+    println!(
+        "tx_b_certificate_seen={}",
+        usize::from(tx_b_certificate_seen)
+    );
+    println!("decision_release={decision_release}");
+    println!("decision_commit_a={decision_commit_a}");
+    println!("fast_count={fast_count}");
+    println!("anchor_count={anchor_count}");
+    println!(
+        "max_resolution_round={}",
+        observations
+            .iter()
+            .map(|observation| observation.round)
+            .max()
+            .unwrap()
+    );
+    println!("conflict_injected_at_ms={conflict_injected_at_ms}");
+    println!("resolution_observed_at_ms={resolution_observed_at_ms}");
+    println!("object_usable_at_ms={object_usable_at_ms}");
+    println!(
+        "conflict_to_resolution_ms={}",
+        resolution_observed_at_ms.saturating_sub(conflict_injected_at_ms)
+    );
+    println!(
+        "conflict_to_object_usable_ms={}",
+        object_usable_at_ms.saturating_sub(conflict_injected_at_ms)
+    );
+    println!();
+
+    for authority in authorities {
+        authority.stop().await;
     }
 }
 
