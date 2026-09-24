@@ -68,6 +68,12 @@ impl CommitObserver {
             commit_interpreter,
             commit_finalizer_handle,
         };
+
+        // Snapper keeps its protocol state in TransactionVoteTracker. Rebuild
+        // that state from the complete persisted commit history before replaying
+        // any output commits or recovering only the post-GC proposal state.
+        observer.recover_snapper_state_from_commits();
+
         observer.recover_and_send_commits(&commit_consumer).await;
 
         // Recover blocks needed for future commits (and block proposals).
@@ -139,6 +145,76 @@ impl CommitObserver {
             .add_scoring_subdags(committed_sub_dags.clone());
 
         Ok(committed_sub_dags)
+    }
+
+    /// Rebuilds Snapper's in-memory state after restart.
+    ///
+    /// Snapper decisions and object stance history live in TransactionVoteTracker
+    /// rather than DagState. The normal vote-tracker recovery below starts at
+    /// gc_round + 1, which is sufficient for future proposals but is not enough
+    /// to reconstruct decisions made by older committed anchors.
+    ///
+    /// Commits retain references to their committed sub-DAG blocks in persistent
+    /// storage, so replaying all commits in order reconstructs Snapper state
+    /// before normal consensus processing resumes.
+    fn recover_snapper_state_from_commits(&mut self) {
+        if !self.context.protocol_config.transaction_voting_enabled() {
+            return;
+        }
+
+        let last_commit = self
+            .store
+            .read_last_commit()
+            .expect("Reading the last commit should not fail");
+        let Some(last_commit) = last_commit else {
+            return;
+        };
+
+        let last_commit_index = last_commit.index();
+        info!("Recovering Snapper state from commits [1..={last_commit_index}]");
+
+        const SNAPPER_RECOVERY_BATCH_SIZE: u32 = if cfg!(test) { 3 } else { 250 };
+
+        let mut recovered_through = 0;
+        for start_index in (1..=last_commit_index).step_by(SNAPPER_RECOVERY_BATCH_SIZE as usize) {
+            let end_index = start_index
+                .saturating_add(SNAPPER_RECOVERY_BATCH_SIZE - 1)
+                .min(last_commit_index);
+
+            let commits = self
+                .store
+                .scan_commits((start_index..=end_index).into())
+                .expect("Scanning commits for Snapper recovery should not fail");
+
+            assert_eq!(
+                commits.len() as u32,
+                end_index.checked_sub(start_index).unwrap() + 1,
+                "Gap while recovering Snapper state: start index: {start_index}, end index: {end_index}, commits: {:?}",
+                commits,
+            );
+
+            for commit in commits {
+                assert_eq!(
+                    commit.index(),
+                    recovered_through + 1,
+                    "Snapper commit recovery must be contiguous"
+                );
+
+                let committed_sub_dag =
+                    load_committed_subdag_from_store(self.store.as_ref(), commit);
+
+                self.transaction_vote_tracker
+                    .resolve_snapper_committed_anchor(
+                        committed_sub_dag.leader,
+                        &committed_sub_dag.blocks,
+                    );
+
+                recovered_through += 1;
+            }
+        }
+
+        assert_eq!(recovered_through, last_commit_index);
+        info!("Recovered Snapper state through commit index {last_commit_index}");
     }
 
     async fn recover_and_send_commits(&mut self, commit_consumer: &CommitConsumerArgs) {
@@ -222,11 +298,8 @@ impl CommitObserver {
                 let committed_sub_dag =
                     load_committed_subdag_from_store(self.store.as_ref(), commit);
 
-                self.transaction_vote_tracker
-                    .resolve_snapper_committed_anchor(
-                        committed_sub_dag.leader,
-                        &committed_sub_dag.blocks,
-                    );
+                // Snapper state was already reconstructed from the complete
+                // persisted commit history before output replay began.
 
                 if !committed_sub_dag.recovered_rejected_transactions && !seen_unfinalized_commit {
                     info!(

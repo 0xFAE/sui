@@ -1194,11 +1194,7 @@ mod test {
 
         // Now spin up core
         let (signals, signal_receivers) = CoreSignals::new(context.clone());
-        let transaction_vote_tracker = TransactionVoteTracker::new(
-            context.clone(),
-            Arc::new(NoopBlockVerifier {}),
-            dag_state.clone(),
-        );
+        // Reuse the same tracker already shared with CommitObserver.
         transaction_vote_tracker.recover_blocks_after_round(dag_state.read().gc_round());
         // Need at least one subscriber to the block broadcast channel.
         let mut block_receiver = signal_receivers.block_broadcast_receiver();
@@ -1590,11 +1586,7 @@ mod test {
 
         // Now recover Core and other components.
         let (signals, signal_receivers) = CoreSignals::new(context.clone());
-        let transaction_vote_tracker = TransactionVoteTracker::new(
-            context.clone(),
-            Arc::new(NoopBlockVerifier {}),
-            dag_state.clone(),
-        );
+        // Reuse the same tracker already shared with CommitObserver.
         transaction_vote_tracker.recover_blocks_after_round(dag_state.read().gc_round());
         // Need at least one subscriber to the block broadcast channel.
         let _block_receiver = signal_receivers.block_broadcast_receiver();

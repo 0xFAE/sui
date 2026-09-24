@@ -803,6 +803,12 @@ impl VoteTrackerState {
             let mut fast_commits = Vec::new();
 
             for transaction in transactions {
+                // TryFastDecideTX is owned-only. Mixed transactions certify
+                // in parallel with ordering but finalize only on commit.
+                if self.snapper_state.requires_consensus(transaction) {
+                    continue;
+                }
+
                 if !self.snapper_state.can_commit_transaction(transaction) {
                     continue;
                 }

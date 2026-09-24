@@ -47,6 +47,9 @@ impl SnapperTransactionId {
 pub struct SnapperTransactionEnvelope {
     magic: [u8; 8],
     pub owned_inputs: Vec<SnapperObjectKey>,
+    /// Evaluation-only transaction kind. Mixed transactions also touch
+    /// shared state and may finalize only from a committed anchor.
+    pub requires_consensus: bool,
     pub payload: Vec<u8>,
 }
 
@@ -55,6 +58,18 @@ impl SnapperTransactionEnvelope {
         Self {
             magic: SNAPPER_TRANSACTION_MAGIC,
             owned_inputs,
+            requires_consensus: false,
+            payload,
+        }
+    }
+
+    /// Evaluation constructor for a transaction with owned inputs that also
+    /// touches shared state and therefore requires Mysticeti ordering.
+    pub fn new_mixed(owned_inputs: Vec<SnapperObjectKey>, payload: Vec<u8>) -> Self {
+        Self {
+            magic: SNAPPER_TRANSACTION_MAGIC,
+            owned_inputs,
+            requires_consensus: true,
             payload,
         }
     }
@@ -158,6 +173,8 @@ pub struct SnapperState {
 
     transaction_inputs: BTreeMap<SnapperTransactionId, Vec<SnapperObjectKey>>,
 
+    transaction_requires_consensus: BTreeMap<SnapperTransactionId, bool>,
+
     stances: BTreeMap<SnapperObjectKey, BTreeMap<AuthorityIndex, SnapperObjectStance>>,
 
     ever_acked: BTreeMap<SnapperObjectKey, BTreeSet<AuthorityIndex>>,
@@ -171,6 +188,7 @@ impl SnapperState {
             own_authority,
             candidates: BTreeMap::new(),
             transaction_inputs: BTreeMap::new(),
+            transaction_requires_consensus: BTreeMap::new(),
             stances: BTreeMap::new(),
             ever_acked: BTreeMap::new(),
             decisions: BTreeMap::new(),
@@ -191,6 +209,10 @@ impl SnapperState {
         self.transaction_inputs
             .entry(transaction)
             .or_insert_with(|| envelope.owned_inputs.clone());
+
+        self.transaction_requires_consensus
+            .entry(transaction)
+            .or_insert(envelope.requires_consensus);
 
         for object in envelope.owned_inputs {
             self.candidates
@@ -219,6 +241,13 @@ impl SnapperState {
 
     pub fn transaction_ids(&self) -> impl Iterator<Item = SnapperTransactionId> + '_ {
         self.transaction_inputs.keys().copied()
+    }
+
+    pub fn requires_consensus(&self, transaction: SnapperTransactionId) -> bool {
+        self.transaction_requires_consensus
+            .get(&transaction)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn objects(&self) -> impl Iterator<Item = SnapperObjectKey> + '_ {

@@ -760,6 +760,352 @@ async fn snapper_vote_split_smoke() {
     }
 }
 
+/// Step 7A: mechanism-level parallel-certification benchmark for one
+/// uncontested mixed transaction. Certification and ordering both advance from
+/// the same live Mysticeti DAG; the mixed transaction is forbidden from the
+/// consensusless fast-finalization route.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "starts a live four-validator parallel-certification benchmark"]
+async fn snapper_parallel_certification_smoke() {
+    telemetry_subscribers::init_for_testing();
+    let db_registry = Registry::new();
+    DBMetrics::init(RegistryService::new(db_registry));
+
+    const AUTHORITIES: usize = 4;
+    let (committee, keypairs) = local_committee_and_keys(0, vec![1; AUTHORITIES]);
+    let protocol_config = ConsensusProtocolConfig::for_testing();
+    assert!(protocol_config.transaction_voting_enabled());
+
+    let temp_dirs = (0..AUTHORITIES)
+        .map(|_| TempDir::new().unwrap())
+        .collect::<Vec<_>>();
+    let mut authorities = Vec::with_capacity(AUTHORITIES);
+    let mut _commit_receivers = Vec::with_capacity(AUTHORITIES);
+
+    for (index, _) in committee.authorities() {
+        let (authority, commit_receiver) = make_eval_authority(
+            index,
+            &temp_dirs[index.value()],
+            committee.clone(),
+            keypairs.clone(),
+            protocol_config.clone(),
+        )
+        .await;
+        authorities.push(authority);
+        _commit_receivers.push(commit_receiver);
+    }
+
+    let object = SnapperObjectKey {
+        object_id: [0x71; SNAPPER_OBJECT_ID_LENGTH],
+        version: 0,
+    };
+    let bytes = SnapperTransactionEnvelope::new_mixed(vec![object], vec![0x72; 256]).encode();
+    let tx = SnapperTransactionEnvelope::transaction_id(&bytes);
+
+    let submitted_at_ms = unix_time_ms();
+    let (included_block, indices, status_receiver) = authorities[0]
+        .transaction_client()
+        .submit(vec![bytes])
+        .await
+        .expect("mixed Snapper transaction should be included");
+    assert_eq!(indices.len(), 1);
+    let included_at_ms = unix_time_ms();
+
+    let cert_future = async {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if authorities
+                .iter()
+                .any(|authority| authority.snapper_has_transaction_certificate(tx))
+            {
+                break unix_time_ms();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for certificate"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+
+    let order_future = async {
+        let status = tokio::time::timeout(Duration::from_secs(30), status_receiver)
+            .await
+            .expect("timed out waiting for sequencing")
+            .expect("status channel closed");
+        match status {
+            BlockStatus::Sequenced(block_ref) => assert_eq!(block_ref, included_block),
+            BlockStatus::GarbageCollected(block_ref) => {
+                panic!("mixed transaction inclusion block was GCed: {block_ref}")
+            }
+        }
+        unix_time_ms()
+    };
+
+    let (certificate_seen_at_ms, ordered_at_ms) = tokio::join!(cert_future, order_future);
+
+    let observations =
+        wait_for_snapper_resolutions(&authorities, object, Duration::from_secs(30)).await;
+
+    assert!(
+        observations.iter().all(|o| {
+            o.decision == SnapperObjectDecision::Commit(tx)
+                && o.path == SnapperResolutionPath::CommittedAnchor
+        }),
+        "mixed tx must finalize only from a committed anchor: {observations:#?}"
+    );
+
+    let finalized_at_ms = observations.iter().map(|o| o.timestamp_ms).max().unwrap();
+    let finalization_round = observations.iter().map(|o| o.round).max().unwrap();
+
+    assert!(certificate_seen_at_ms <= finalized_at_ms);
+    assert!(ordered_at_ms <= finalized_at_ms);
+
+    println!();
+    println!("=== Snapper Step 7A: parallel certification ===");
+    println!("protocol=snapper");
+    println!("transaction_kind=mixed");
+    println!("submitted_at_ms={submitted_at_ms}");
+    println!("included_at_ms={included_at_ms}");
+    println!("certificate_seen_at_ms={certificate_seen_at_ms}");
+    println!("ordered_at_ms={ordered_at_ms}");
+    println!("finalized_at_ms={finalized_at_ms}");
+    println!("included_round={}", included_block.round);
+    println!("finalization_round={finalization_round}");
+    println!(
+        "submit_to_inclusion_ms={}",
+        included_at_ms.saturating_sub(submitted_at_ms)
+    );
+    println!(
+        "submit_to_certificate_ms={}",
+        certificate_seen_at_ms.saturating_sub(submitted_at_ms)
+    );
+    println!(
+        "submit_to_order_ms={}",
+        ordered_at_ms.saturating_sub(submitted_at_ms)
+    );
+    println!(
+        "submit_to_finalize_ms={}",
+        finalized_at_ms.saturating_sub(submitted_at_ms)
+    );
+    println!(
+        "certificate_order_delta_ms={}",
+        certificate_seen_at_ms.abs_diff(ordered_at_ms)
+    );
+    println!(
+        "finalize_after_both_ms={}",
+        finalized_at_ms.saturating_sub(certificate_seen_at_ms.max(ordered_at_ms))
+    );
+    println!();
+
+    for authority in authorities {
+        authority.stop().await;
+    }
+}
+
+/// Step 7B: sequential certify-then-order control.
+///
+/// The same live four-validator Mysticeti network is used as in Step 7A.
+/// First, a Snapper transaction is injected only to drive the certification
+/// mechanism. The ordering phase is deliberately not admitted until a
+/// transaction certificate is observed. At that point an opaque ordering
+/// marker of the same serialized size is submitted to Mysticeti and we wait
+/// for that marker's inclusion block to be sequenced.
+///
+/// The marker is an evaluation device: it represents the point at which a
+/// certify-then-order design would admit the now-certified mixed transaction
+/// to consensus. We therefore compare "both prerequisites ready":
+///   Step 7A: max(certificate, ordering)
+///   Step 7B: certificate, then ordering.
+///
+/// This is a controlled mechanism comparison, not an implementation of the
+/// historical Sui Quorum Driver.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "starts a live four-validator sequential certify-then-order benchmark"]
+async fn snapper_sequential_certify_then_order_smoke() {
+    telemetry_subscribers::init_for_testing();
+    let db_registry = Registry::new();
+    DBMetrics::init(RegistryService::new(db_registry));
+
+    const AUTHORITIES: usize = 4;
+
+    let (committee, keypairs) = local_committee_and_keys(0, vec![1; AUTHORITIES]);
+
+    let protocol_config = ConsensusProtocolConfig::for_testing();
+    assert!(protocol_config.transaction_voting_enabled());
+
+    let temp_dirs = (0..AUTHORITIES)
+        .map(|_| TempDir::new().unwrap())
+        .collect::<Vec<_>>();
+
+    let mut authorities = Vec::with_capacity(AUTHORITIES);
+    let mut _commit_receivers = Vec::with_capacity(AUTHORITIES);
+
+    for (index, _) in committee.authorities() {
+        let (authority, commit_receiver) = make_eval_authority(
+            index,
+            &temp_dirs[index.value()],
+            committee.clone(),
+            keypairs.clone(),
+            protocol_config.clone(),
+        )
+        .await;
+
+        authorities.push(authority);
+        _commit_receivers.push(commit_receiver);
+    }
+
+    let object = SnapperObjectKey {
+        object_id: [0x81; SNAPPER_OBJECT_ID_LENGTH],
+        version: 0,
+    };
+
+    let certification_bytes =
+        SnapperTransactionEnvelope::new_mixed(vec![object], vec![0x82; 256]).encode();
+
+    let tx = SnapperTransactionEnvelope::transaction_id(&certification_bytes);
+
+    let serialized_tx_bytes = certification_bytes.len();
+
+    let submitted_at_ms = unix_time_ms();
+
+    let (certification_included_block, certification_indices, _certification_status_receiver) =
+        authorities[0]
+            .transaction_client()
+            .submit(vec![certification_bytes])
+            .await
+            .expect("certification carrier should be included");
+
+    assert_eq!(certification_indices.len(), 1);
+
+    let certification_included_at_ms = unix_time_ms();
+
+    let certificate_deadline = Instant::now() + Duration::from_secs(30);
+
+    let certificate_seen_at_ms = loop {
+        if authorities
+            .iter()
+            .any(|authority| authority.snapper_has_transaction_certificate(tx))
+        {
+            break unix_time_ms();
+        }
+
+        assert!(
+            Instant::now() < certificate_deadline,
+            "timed out waiting for sequential-control certificate"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    };
+
+    let ordering_admitted_at_ms = unix_time_ms();
+
+    assert!(
+        ordering_admitted_at_ms >= certificate_seen_at_ms,
+        "ordering was admitted before certification completed"
+    );
+
+    let mut ordering_marker = vec![0x83; serialized_tx_bytes.max(16)];
+    ordering_marker[..8].copy_from_slice(b"SEQORD01");
+
+    let (ordering_included_block, ordering_indices, ordering_status_receiver) = authorities[0]
+        .transaction_client()
+        .submit(vec![ordering_marker])
+        .await
+        .expect("ordering marker should be included");
+
+    assert_eq!(ordering_indices.len(), 1);
+
+    let ordering_included_at_ms = unix_time_ms();
+
+    let status = tokio::time::timeout(Duration::from_secs(30), ordering_status_receiver)
+        .await
+        .expect("timed out waiting for sequential ordering marker")
+        .expect("ordering marker status channel closed");
+
+    match status {
+        BlockStatus::Sequenced(block_ref) => {
+            assert_eq!(
+                block_ref, ordering_included_block,
+                "sequenced block differs from ordering-marker inclusion block"
+            );
+        }
+        BlockStatus::GarbageCollected(block_ref) => {
+            panic!("sequential ordering-marker inclusion block was garbage collected: {block_ref}");
+        }
+    }
+
+    let ordered_at_ms = unix_time_ms();
+    let both_ready_at_ms = ordered_at_ms;
+
+    assert!(
+        certificate_seen_at_ms <= ordering_admitted_at_ms
+            && ordering_admitted_at_ms <= ordering_included_at_ms
+            && ordering_included_at_ms <= ordered_at_ms,
+        "sequential phase timestamps are out of order"
+    );
+
+    println!();
+    println!("=== Snapper Step 7B: sequential certify-then-order control ===");
+    println!("protocol=sequential-control");
+    println!("transaction_kind=mixed");
+    println!("ordering_gate=after_certificate");
+    println!("ordering_marker_bytes={}", serialized_tx_bytes);
+    println!("submitted_at_ms={submitted_at_ms}");
+    println!("certification_included_at_ms={certification_included_at_ms}");
+    println!("certificate_seen_at_ms={certificate_seen_at_ms}");
+    println!("ordering_admitted_at_ms={ordering_admitted_at_ms}");
+    println!("ordering_included_at_ms={ordering_included_at_ms}");
+    println!("ordered_at_ms={ordered_at_ms}");
+    println!("both_ready_at_ms={both_ready_at_ms}");
+    println!(
+        "certification_included_round={}",
+        certification_included_block.round
+    );
+    println!("ordering_included_round={}", ordering_included_block.round);
+    println!(
+        "submit_to_certification_inclusion_ms={}",
+        certification_included_at_ms.saturating_sub(submitted_at_ms)
+    );
+    println!(
+        "submit_to_certificate_ms={}",
+        certificate_seen_at_ms.saturating_sub(submitted_at_ms)
+    );
+    println!(
+        "certification_inclusion_to_certificate_ms={}",
+        certificate_seen_at_ms.saturating_sub(certification_included_at_ms)
+    );
+    println!(
+        "certificate_to_ordering_admission_ms={}",
+        ordering_admitted_at_ms.saturating_sub(certificate_seen_at_ms)
+    );
+    println!(
+        "certificate_to_ordering_inclusion_ms={}",
+        ordering_included_at_ms.saturating_sub(certificate_seen_at_ms)
+    );
+    println!(
+        "certificate_to_order_ms={}",
+        ordered_at_ms.saturating_sub(certificate_seen_at_ms)
+    );
+    println!(
+        "ordering_admission_to_inclusion_ms={}",
+        ordering_included_at_ms.saturating_sub(ordering_admitted_at_ms)
+    );
+    println!(
+        "ordering_admission_to_order_ms={}",
+        ordered_at_ms.saturating_sub(ordering_admitted_at_ms)
+    );
+    println!(
+        "submit_to_both_ready_ms={}",
+        both_ready_at_ms.saturating_sub(submitted_at_ms)
+    );
+    println!();
+
+    for authority in authorities {
+        authority.stop().await;
+    }
+}
+
 fn ensure_report_is_sane(report: &CommonEvalReport, expected_transactions: usize) {
     assert_eq!(report.tx_count(), expected_transactions);
     assert!(report.throughput_tps.is_finite());
