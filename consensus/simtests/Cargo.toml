@@ -16,6 +16,7 @@ arc-swap.workspace = true
 consensus-config.workspace = true
 consensus-core.workspace = true
 consensus-types.workspace = true
+futures.workspace = true
 mysten-metrics.workspace = true
 mysten-network.workspace = true
 parking_lot.workspace = true
