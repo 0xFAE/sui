@@ -14,7 +14,11 @@ use consensus_config::{
 };
 use consensus_core::{
     Clock, CommitConsumerArgs, CommitConsumerMonitor, CommittedSubDag, ConsensusAuthority,
-    NetworkType, TransactionClient, TransactionVerifier, to_socket_addr,
+    NetworkType, TransactionClient, TransactionVerifier,
+    snapper::{
+        SnapperObjectKey, SnapperObjectStance, SnapperResolutionObservation, SnapperTransactionId,
+    },
+    to_socket_addr,
 };
 use consensus_types::block::BlockTimestampMs;
 use mysten_metrics::monitored_mpsc::UnboundedReceiver;
@@ -121,6 +125,49 @@ impl AuthorityNode {
         let inner = self.inner.lock();
         if let Some(inner) = inner.as_ref() {
             inner.transaction_client()
+        } else {
+            panic!("Node not initialised");
+        }
+    }
+
+    /// Evaluation-only read-only hook into Snapper's local certificate state.
+    pub fn snapper_has_transaction_certificate(
+        &self,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        let inner = self.inner.lock();
+        if let Some(inner) = inner.as_ref() {
+            inner
+                .consensus_authority
+                .snapper_has_transaction_certificate(transaction)
+        } else {
+            panic!("Node not initialised");
+        }
+    }
+
+    /// Evaluation-only read-only hook into Snapper's local stance state.
+    pub fn snapper_own_stance(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperObjectStance> {
+        let inner = self.inner.lock();
+        if let Some(inner) = inner.as_ref() {
+            inner.consensus_authority.snapper_own_stance(object)
+        } else {
+            panic!("Node not initialised");
+        }
+    }
+
+    /// Evaluation-only read-only hook into Snapper's local resolution metadata.
+    pub fn snapper_resolution_observation(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperResolutionObservation> {
+        let inner = self.inner.lock();
+        if let Some(inner) = inner.as_ref() {
+            inner
+                .consensus_authority
+                .snapper_resolution_observation(object)
         } else {
             panic!("Node not initialised");
         }
