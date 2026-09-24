@@ -38,6 +38,9 @@ use crate::{
     peers_pool::PeersPool,
     round_prober::{RoundProber, RoundProberHandle},
     round_tracker::RoundTracker,
+    snapper::{
+        SnapperObjectKey, SnapperObjectStance, SnapperResolutionObservation, SnapperTransactionId,
+    },
     storage::rocksdb_store::RocksDBStore,
     subscriber::Subscriber,
     synchronizer::{Synchronizer, SynchronizerHandle},
@@ -116,6 +119,47 @@ impl ConsensusAuthority {
         }
     }
 
+    /// Evaluation hook used by the cross-layer Snapper benchmark.
+    ///
+    /// Read-only: this does not affect consensus behavior.
+    pub fn snapper_resolution_observation(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperResolutionObservation> {
+        match self {
+            Self::WithTonic(authority) => authority.snapper_resolution_observation(object),
+        }
+    }
+
+    /// Evaluation-only read-only hook.
+    pub fn snapper_own_stance(&self, object: &SnapperObjectKey) -> Option<SnapperObjectStance> {
+        match self {
+            Self::WithTonic(authority) => authority.snapper_own_stance(object),
+        }
+    }
+
+    /// Evaluation-only read-only hook.
+    pub fn snapper_has_transaction_certificate(&self, transaction: SnapperTransactionId) -> bool {
+        match self {
+            Self::WithTonic(authority) => {
+                authority.snapper_has_transaction_certificate(transaction)
+            }
+        }
+    }
+
+    /// Evaluation-only: whether an author's latest DAG branch sees the tx certificate.
+    pub fn snapper_author_certificate_visible(
+        &self,
+        author: usize,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        match self {
+            Self::WithTonic(authority) => {
+                authority.snapper_author_certificate_visible(author, transaction)
+            }
+        }
+    }
+
     pub fn store(&self) -> Arc<RocksDBStore> {
         match self {
             Self::WithTonic(authority) => authority.store(),
@@ -157,6 +201,7 @@ where
     context: Arc<Context>,
     start_time: Instant,
     transaction_client: Arc<TransactionClient>,
+    transaction_vote_tracker: TransactionVoteTracker,
     synchronizer: Arc<SynchronizerHandle>,
     store: Arc<RocksDBStore>,
 
@@ -527,6 +572,7 @@ where
             context,
             start_time,
             transaction_client: Arc::new(tx_client),
+            transaction_vote_tracker,
             synchronizer,
             store,
             commit_syncer_handle,
@@ -574,6 +620,38 @@ where
 
     pub(crate) fn transaction_client(&self) -> Arc<TransactionClient> {
         self.transaction_client.clone()
+    }
+
+    pub(crate) fn snapper_resolution_observation(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperResolutionObservation> {
+        self.transaction_vote_tracker
+            .snapper_resolution_observation(object)
+    }
+
+    pub(crate) fn snapper_own_stance(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperObjectStance> {
+        self.transaction_vote_tracker.snapper_own_stance(object)
+    }
+
+    pub(crate) fn snapper_has_transaction_certificate(
+        &self,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        self.transaction_vote_tracker
+            .snapper_has_transaction_certificate(transaction)
+    }
+
+    pub(crate) fn snapper_author_certificate_visible(
+        &self,
+        author: usize,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        self.transaction_vote_tracker
+            .snapper_author_certificate_visible(author, transaction)
     }
 
     pub(crate) fn store(&self) -> Arc<RocksDBStore> {

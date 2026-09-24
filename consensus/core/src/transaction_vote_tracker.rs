@@ -1,7 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use consensus_config::Stake;
 use consensus_types::block::{BlockRef, Round, TransactionIndex};
@@ -11,10 +14,15 @@ use tracing::info;
 
 use crate::{
     BlockAPI as _, VerifiedBlock,
-    block::{BlockTransactionVotes, GENESIS_ROUND},
+    block::{BlockTransactionVotes, GENESIS_ROUND, Transaction},
     block_verifier::BlockVerifier,
     context::Context,
     dag_state::DagState,
+    snapper::{
+        SnapperBottomVoteKind, SnapperObjectDecision, SnapperObjectKey, SnapperObjectStance,
+        SnapperObjectStanceVote, SnapperResolutionObservation, SnapperResolutionPath, SnapperState,
+        SnapperTransactionEnvelope, SnapperTransactionId,
+    },
     stake_aggregator::{QuorumThreshold, StakeAggregator},
 };
 
@@ -166,6 +174,97 @@ impl TransactionVoteTracker {
         votes
     }
 
+    /// Processes the newly linked causal history for Snapper and returns local
+    /// stance changes to include in the next proposed block.
+    pub(crate) fn get_snapper_stance_votes(
+        &self,
+        proposal_round: Round,
+        proposal_parents: &[BlockRef],
+        block_refs: &[BlockRef],
+        current_transactions: &[Transaction],
+    ) -> Vec<SnapperObjectStanceVote> {
+        self.vote_tracker_state.write().get_snapper_stance_votes(
+            proposal_round,
+            proposal_parents,
+            block_refs,
+            current_transactions,
+        )
+    }
+
+    /// Applies the Snapper committed-anchor rule to a committed Mysticeti
+    /// leader. Transaction certificates have priority over skip/unlock
+    /// certificates, exactly as in ResolveOnCommitObj.
+    pub(crate) fn resolve_snapper_committed_anchor(
+        &self,
+        anchor: BlockRef,
+        committed_blocks: &[VerifiedBlock],
+    ) -> Vec<(SnapperObjectKey, SnapperObjectDecision)> {
+        self.vote_tracker_state
+            .write()
+            .resolve_snapper_committed_anchor(anchor, committed_blocks)
+    }
+
+    pub fn snapper_decision(&self, object: &SnapperObjectKey) -> Option<SnapperObjectDecision> {
+        self.vote_tracker_state
+            .read()
+            .snapper_state
+            .decision(object)
+    }
+
+    pub(crate) fn snapper_resolution_observation(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperResolutionObservation> {
+        self.vote_tracker_state
+            .read()
+            .snapper_resolution_observations
+            .get(object)
+            .copied()
+    }
+
+    pub(crate) fn snapper_own_stance(
+        &self,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperObjectStance> {
+        self.vote_tracker_state
+            .read()
+            .snapper_state
+            .own_stance(object)
+    }
+
+    pub(crate) fn snapper_has_transaction_certificate(
+        &self,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        let state = self.vote_tracker_state.read();
+        state
+            .snapper_blocks
+            .keys()
+            .copied()
+            .any(|block_ref| state.snapper_is_fast_cert(block_ref, transaction))
+    }
+
+    /// Evaluation-only: whether the latest block authored by `author`
+    /// has `transaction` certified in its causal history.
+    pub(crate) fn snapper_author_certificate_visible(
+        &self,
+        author: usize,
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        let state = self.vote_tracker_state.read();
+
+        let latest = state
+            .snapper_blocks
+            .keys()
+            .copied()
+            .filter(|block_ref| block_ref.author.value() == author)
+            .max_by_key(|block_ref| block_ref.round);
+
+        latest
+            .map(|block_ref| state.snapper_has_cert(block_ref, transaction))
+            .unwrap_or(false)
+    }
+
     /// Retrieves transactions in the block that have received reject votes, and the total stake of the votes.
     /// TransactionIndex not included in the output has no reject votes.
     /// Returns None if no information is found for the block.
@@ -216,15 +315,713 @@ struct VoteTrackerState {
 
     // Highest round where blocks are GC'ed.
     gc_round: Round,
+
+    // Snapper 3f+1 object-level state.
+    snapper_state: SnapperState,
+
+    // Blocks available to Snapper's DAG-local predicates. This is separate
+    // from the legacy transaction vote map because committed-anchor recovery
+    // may need to inspect blocks without changing legacy reject-vote state.
+    snapper_blocks: BTreeMap<BlockRef, VerifiedBlock>,
+
+    // Blocks whose Snapper transactions and stance declarations have already
+    // been incorporated into snapper_state.
+    snapper_processed_blocks: BTreeSet<BlockRef>,
+
+    // First local resolution observation per object. Evaluation-only metadata.
+    snapper_resolution_observations: BTreeMap<SnapperObjectKey, SnapperResolutionObservation>,
 }
 
 impl VoteTrackerState {
     fn new(context: Arc<Context>) -> Self {
+        let own_authority = context.own_index;
         Self {
             context,
             votes: BTreeMap::new(),
             gc_round: GENESIS_ROUND,
+            snapper_state: SnapperState::new(own_authority),
+            snapper_blocks: BTreeMap::new(),
+            snapper_processed_blocks: BTreeSet::new(),
+            snapper_resolution_observations: BTreeMap::new(),
         }
+    }
+
+    fn record_snapper_resolutions(
+        &mut self,
+        round: Round,
+        path: SnapperResolutionPath,
+        decisions: &[(SnapperObjectKey, SnapperObjectDecision)],
+    ) {
+        let timestamp_ms = self.context.clock.timestamp_utc_ms();
+        for (object, decision) in decisions {
+            self.snapper_resolution_observations
+                .entry(*object)
+                .or_insert(SnapperResolutionObservation {
+                    decision: *decision,
+                    path,
+                    round,
+                    timestamp_ms,
+                });
+        }
+    }
+
+    fn get_snapper_stance_votes(
+        &mut self,
+        proposal_round: Round,
+        proposal_parents: &[BlockRef],
+        block_refs: &[BlockRef],
+        current_transactions: &[Transaction],
+    ) -> Vec<SnapperObjectStanceVote> {
+        // Reconstruct all proposal-parent history needed after recovery, then
+        // incorporate newly linked history.
+        let mut to_process = block_refs.to_vec();
+        for parent in proposal_parents {
+            to_process.extend(self.snapper_causal_history_refs(*parent));
+        }
+        to_process.sort();
+        to_process.dedup();
+        self.process_snapper_blocks(&to_process);
+
+        // Transactions carried by the block being built are reflexively
+        // included by that block.
+        for transaction in current_transactions {
+            self.snapper_state.record_transaction(transaction.data());
+        }
+
+        // TryDecide precedes CastVotes in the protocol.
+        let _ = self.snapper_try_fast_decisions();
+
+        self.snapper_take_stance_changes(proposal_round, proposal_parents)
+    }
+
+    fn observe_snapper_blocks(&mut self, blocks: &[VerifiedBlock]) {
+        for block in blocks {
+            self.snapper_blocks
+                .entry(block.reference())
+                .or_insert_with(|| block.clone());
+        }
+    }
+
+    fn process_snapper_blocks(&mut self, block_refs: &[BlockRef]) {
+        let mut blocks = block_refs
+            .iter()
+            .filter(|block_ref| !self.snapper_processed_blocks.contains(block_ref))
+            .filter_map(|block_ref| self.snapper_blocks.get(block_ref).cloned())
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| block.reference());
+
+        for block in blocks {
+            for transaction in block.transactions() {
+                self.snapper_state.record_transaction(transaction.data());
+            }
+
+            for vote in block.snapper_object_stance_votes() {
+                if let Err(error) =
+                    self.snapper_state
+                        .apply_stance(block.author(), vote.object, vote.stance)
+                {
+                    tracing::debug!(
+                        "Ignoring invalid Snapper stance in block {}: {}",
+                        block.reference(),
+                        error
+                    );
+                }
+            }
+
+            self.snapper_processed_blocks.insert(block.reference());
+        }
+    }
+
+    fn snapper_own_ancestor(&self, block: &VerifiedBlock) -> Option<BlockRef> {
+        block
+            .ancestors()
+            .iter()
+            .copied()
+            .find(|ancestor| ancestor.author == block.author())
+    }
+
+    /// Stance(id,o,b): latest declaration for `o` in b's author's own chain.
+    fn snapper_stance_at(
+        &self,
+        block_ref: BlockRef,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperObjectStance> {
+        let author = block_ref.author;
+        let mut current = Some(block_ref);
+
+        while let Some(reference) = current {
+            let block = self.snapper_blocks.get(&reference)?;
+            if block.author() != author {
+                return None;
+            }
+
+            if let Some(vote) = block
+                .snapper_object_stance_votes()
+                .iter()
+                .rev()
+                .find(|vote| &vote.object == object)
+            {
+                return Some(vote.stance);
+            }
+
+            current = self.snapper_own_ancestor(block);
+        }
+
+        None
+    }
+
+    /// AckedBefore(id,o,b): an earlier declaration in id's own chain ACKed a
+    /// transaction for this object.
+    fn snapper_acked_before(&self, block_ref: BlockRef, object: &SnapperObjectKey) -> bool {
+        let Some(block) = self.snapper_blocks.get(&block_ref) else {
+            return false;
+        };
+        let author = block.author();
+        let mut current = self.snapper_own_ancestor(block);
+
+        while let Some(reference) = current {
+            let Some(block) = self.snapper_blocks.get(&reference) else {
+                return false;
+            };
+            if block.author() != author {
+                return false;
+            }
+
+            if block.snapper_object_stance_votes().iter().any(|vote| {
+                vote.object == *object && matches!(vote.stance, SnapperObjectStance::Transaction(_))
+            }) {
+                return true;
+            }
+
+            current = self.snapper_own_ancestor(block);
+        }
+
+        false
+    }
+
+    fn snapper_causal_history_refs(&self, root: BlockRef) -> Vec<BlockRef> {
+        let mut visited = BTreeSet::new();
+        let mut stack = vec![root];
+
+        while let Some(reference) = stack.pop() {
+            if !visited.insert(reference) {
+                continue;
+            }
+            let Some(block) = self.snapper_blocks.get(&reference) else {
+                continue;
+            };
+            stack.extend(block.ancestors().iter().copied());
+        }
+
+        visited.into_iter().collect()
+    }
+
+    fn snapper_owned_inputs_for_tx(
+        &self,
+        transaction: SnapperTransactionId,
+    ) -> Option<Vec<SnapperObjectKey>> {
+        if let Some(inputs) = self.snapper_state.owned_inputs(transaction) {
+            return Some(inputs.to_vec());
+        }
+
+        for block in self.snapper_blocks.values() {
+            for tx in block.transactions() {
+                let Some(envelope) = SnapperTransactionEnvelope::decode(tx.data()) else {
+                    continue;
+                };
+                if SnapperTransactionEnvelope::transaction_id(tx.data()) == transaction {
+                    return Some(envelope.owned_inputs);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Includes(b,tx): tx appears in b's reflexive causal history.
+    fn snapper_includes(&self, root: BlockRef, transaction: SnapperTransactionId) -> bool {
+        for reference in self.snapper_causal_history_refs(root) {
+            let Some(block) = self.snapper_blocks.get(&reference) else {
+                continue;
+            };
+            for tx in block.transactions() {
+                if SnapperTransactionEnvelope::decode(tx.data()).is_some()
+                    && SnapperTransactionEnvelope::transaction_id(tx.data()) == transaction
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn snapper_visible_candidates(
+        &self,
+        root: BlockRef,
+        object: &SnapperObjectKey,
+    ) -> BTreeSet<SnapperTransactionId> {
+        let mut candidates = BTreeSet::new();
+
+        for reference in self.snapper_causal_history_refs(root) {
+            let Some(block) = self.snapper_blocks.get(&reference) else {
+                continue;
+            };
+            for tx in block.transactions() {
+                let Some(envelope) = SnapperTransactionEnvelope::decode(tx.data()) else {
+                    continue;
+                };
+                if envelope.owned_inputs.contains(object) {
+                    candidates.insert(SnapperTransactionEnvelope::transaction_id(tx.data()));
+                }
+            }
+        }
+
+        candidates
+    }
+
+    /// RecoveryObjs(b), specialized to the owned-object evaluation path.
+    ///
+    /// Conflict is computed from b's causal history and then closed over all
+    /// sibling owned inputs of the conflicting candidates.
+    fn snapper_recovery_objects_at(&self, root: BlockRef) -> BTreeSet<SnapperObjectKey> {
+        let mut candidates: BTreeMap<SnapperObjectKey, BTreeSet<SnapperTransactionId>> =
+            BTreeMap::new();
+        let mut inputs_by_tx: BTreeMap<SnapperTransactionId, Vec<SnapperObjectKey>> =
+            BTreeMap::new();
+
+        for reference in self.snapper_causal_history_refs(root) {
+            let Some(block) = self.snapper_blocks.get(&reference) else {
+                continue;
+            };
+            for tx in block.transactions() {
+                let Some(envelope) = SnapperTransactionEnvelope::decode(tx.data()) else {
+                    continue;
+                };
+                let transaction = SnapperTransactionEnvelope::transaction_id(tx.data());
+                inputs_by_tx
+                    .entry(transaction)
+                    .or_insert_with(|| envelope.owned_inputs.clone());
+                for object in envelope.owned_inputs {
+                    candidates.entry(object).or_default().insert(transaction);
+                }
+            }
+        }
+
+        let mut recovery = candidates
+            .iter()
+            .filter_map(|(object, txs)| (txs.len() >= 2).then_some(*object))
+            .collect::<BTreeSet<_>>();
+
+        loop {
+            let before = recovery.len();
+            let current = recovery.iter().copied().collect::<Vec<_>>();
+            for object in current {
+                let txs = candidates.get(&object).cloned().unwrap_or_default();
+                for transaction in txs {
+                    if let Some(inputs) = inputs_by_tx.get(&transaction) {
+                        recovery.extend(inputs.iter().copied());
+                    }
+                }
+            }
+            if recovery.len() == before {
+                break;
+            }
+        }
+
+        recovery
+    }
+
+    fn snapper_round_parents(&self, block_ref: BlockRef) -> Vec<BlockRef> {
+        let Some(block) = self.snapper_blocks.get(&block_ref) else {
+            return vec![];
+        };
+        let parent_round = block.round().saturating_sub(1);
+        block
+            .ancestors()
+            .iter()
+            .copied()
+            .filter(|parent| parent.round == parent_round)
+            .collect()
+    }
+
+    /// IsFastVoteTX(b,tx).
+    fn snapper_is_fast_vote(&self, block_ref: BlockRef, transaction: SnapperTransactionId) -> bool {
+        if !self.snapper_includes(block_ref, transaction) {
+            return false;
+        }
+
+        let Some(inputs) = self.snapper_owned_inputs_for_tx(transaction) else {
+            return false;
+        };
+
+        inputs.iter().all(|object| {
+            self.snapper_stance_at(block_ref, object)
+                == Some(SnapperObjectStance::Transaction(transaction))
+        })
+    }
+
+    /// IsFastCertTX(b,tx).
+    fn snapper_is_fast_cert(&self, block_ref: BlockRef, transaction: SnapperTransactionId) -> bool {
+        if !self.snapper_is_fast_vote(block_ref, transaction) {
+            return false;
+        }
+
+        let mut authors = BTreeSet::new();
+        let mut stake = 0;
+        for parent in self.snapper_round_parents(block_ref) {
+            if self.snapper_is_fast_vote(parent, transaction) && authors.insert(parent.author) {
+                stake += self.context.committee.stake(parent.author);
+            }
+        }
+
+        self.context.committee.reached_quorum(stake)
+    }
+
+    /// HasCertTX(b,tx), reflexive.
+    fn snapper_has_cert(&self, root: BlockRef, transaction: SnapperTransactionId) -> bool {
+        self.snapper_causal_history_refs(root)
+            .into_iter()
+            .any(|reference| self.snapper_is_fast_cert(reference, transaction))
+    }
+
+    /// CertVisible for the block currently being proposed.
+    ///
+    /// This intentionally reads only the proposed block's parents and their
+    /// causal histories; it never reads the stance being chosen for the new
+    /// block.
+    fn snapper_cert_visible(
+        &self,
+        proposal_round: Round,
+        proposal_parents: &[BlockRef],
+        transaction: SnapperTransactionId,
+    ) -> bool {
+        let parent_round = proposal_round.saturating_sub(1);
+        let mut authors = BTreeSet::new();
+        let mut stake = 0;
+
+        for parent in proposal_parents
+            .iter()
+            .copied()
+            .filter(|parent| parent.round == parent_round)
+        {
+            if self.snapper_is_fast_vote(parent, transaction) && authors.insert(parent.author) {
+                stake += self.context.committee.stake(parent.author);
+            }
+        }
+
+        if self.context.committee.reached_quorum(stake) {
+            return true;
+        }
+
+        proposal_parents
+            .iter()
+            .copied()
+            .any(|parent| self.snapper_has_cert(parent, transaction))
+    }
+
+    fn snapper_bottom_vote_kind_at(
+        &self,
+        block_ref: BlockRef,
+        object: &SnapperObjectKey,
+    ) -> Option<SnapperBottomVoteKind> {
+        if self.snapper_stance_at(block_ref, object) != Some(SnapperObjectStance::Bottom) {
+            return None;
+        }
+
+        if !self.snapper_recovery_objects_at(block_ref).contains(object) {
+            return None;
+        }
+
+        if self.snapper_acked_before(block_ref, object) {
+            Some(SnapperBottomVoteKind::Unlock)
+        } else {
+            Some(SnapperBottomVoteKind::Skip)
+        }
+    }
+
+    /// IsSkipCertObj(b,o).
+    fn snapper_is_skip_cert(&self, block_ref: BlockRef, object: &SnapperObjectKey) -> bool {
+        let mut authors = BTreeSet::new();
+        let mut stake = 0;
+
+        for parent in self.snapper_round_parents(block_ref) {
+            if self.snapper_bottom_vote_kind_at(parent, object) == Some(SnapperBottomVoteKind::Skip)
+                && authors.insert(parent.author)
+            {
+                stake += self.context.committee.stake(parent.author);
+            }
+        }
+
+        self.context.committee.reached_quorum(stake)
+    }
+
+    /// IsUnlockCertObj(b,o): both skip and unlock votes count toward the
+    /// opposing quorum.
+    fn snapper_is_unlock_cert(&self, block_ref: BlockRef, object: &SnapperObjectKey) -> bool {
+        let mut authors = BTreeSet::new();
+        let mut stake = 0;
+
+        for parent in self.snapper_round_parents(block_ref) {
+            if self.snapper_bottom_vote_kind_at(parent, object).is_some()
+                && authors.insert(parent.author)
+            {
+                stake += self.context.committee.stake(parent.author);
+            }
+        }
+
+        self.context.committee.reached_quorum(stake)
+    }
+
+    fn snapper_has_opposing_cert(&self, root: BlockRef, object: &SnapperObjectKey) -> bool {
+        self.snapper_causal_history_refs(root)
+            .into_iter()
+            .any(|reference| {
+                self.snapper_is_skip_cert(reference, object)
+                    || self.snapper_is_unlock_cert(reference, object)
+            })
+    }
+
+    /// TryFastDecideTX and TrySkipDecideObj.
+    fn snapper_try_fast_decisions(&mut self) -> Vec<(SnapperObjectKey, SnapperObjectDecision)> {
+        let mut changed = Vec::new();
+        let rounds = self
+            .snapper_blocks
+            .keys()
+            .map(|reference| reference.round)
+            .filter(|round| *round > GENESIS_ROUND)
+            .collect::<BTreeSet<_>>();
+
+        for round in rounds {
+            let round_blocks = self
+                .snapper_blocks
+                .keys()
+                .copied()
+                .filter(|reference| reference.round == round)
+                .collect::<Vec<_>>();
+
+            let transactions = self.snapper_state.transaction_ids().collect::<Vec<_>>();
+            let mut fast_commits = Vec::new();
+
+            for transaction in transactions {
+                if !self.snapper_state.can_commit_transaction(transaction) {
+                    continue;
+                }
+
+                let mut authors = BTreeSet::new();
+                let mut stake = 0;
+                for block_ref in &round_blocks {
+                    if self.snapper_is_fast_cert(*block_ref, transaction)
+                        && authors.insert(block_ref.author)
+                    {
+                        stake += self.context.committee.stake(block_ref.author);
+                    }
+                }
+
+                if self.context.committee.reached_quorum(stake) {
+                    fast_commits.push(transaction);
+                }
+            }
+
+            for transaction in fast_commits {
+                if let Ok(decisions) = self.snapper_state.commit_transaction(transaction) {
+                    self.record_snapper_resolutions(round, SnapperResolutionPath::Fast, &decisions);
+                    changed.extend(decisions);
+                }
+            }
+
+            let objects = self.snapper_state.objects().collect::<Vec<_>>();
+            let mut fast_releases = Vec::new();
+
+            for object in objects {
+                if self.snapper_state.is_resolved(&object) {
+                    continue;
+                }
+
+                let mut authors = BTreeSet::new();
+                let mut stake = 0;
+                for block_ref in &round_blocks {
+                    if self.snapper_is_skip_cert(*block_ref, &object)
+                        && authors.insert(block_ref.author)
+                    {
+                        stake += self.context.committee.stake(block_ref.author);
+                    }
+                }
+
+                if self.context.committee.reached_quorum(stake) {
+                    fast_releases.push(object);
+                }
+            }
+
+            for object in fast_releases {
+                if let Ok(decisions) = self.snapper_state.release_object(object) {
+                    self.record_snapper_resolutions(round, SnapperResolutionPath::Fast, &decisions);
+                    changed.extend(decisions);
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// CastVotes for the block currently being built.
+    fn snapper_take_stance_changes(
+        &mut self,
+        proposal_round: Round,
+        proposal_parents: &[BlockRef],
+    ) -> Vec<SnapperObjectStanceVote> {
+        let recovery = self.snapper_state.current_recovery_objects();
+        let mut changes = Vec::new();
+
+        // Phase 2: objects in recovery.
+        for object in recovery.iter().copied() {
+            if self.snapper_state.is_resolved(&object) {
+                continue;
+            }
+
+            let should_bottom = match self.snapper_state.own_stance(&object) {
+                None => true,
+                Some(SnapperObjectStance::Bottom) => false,
+                Some(SnapperObjectStance::Transaction(transaction)) => {
+                    let dead = self.snapper_state.is_transaction_dead(transaction);
+                    let sibling_abandoned = self
+                        .snapper_state
+                        .owned_inputs(transaction)
+                        .map(|inputs| {
+                            inputs.iter().any(|input| {
+                                self.snapper_state.own_stance(input)
+                                    != Some(SnapperObjectStance::Transaction(transaction))
+                            })
+                        })
+                        .unwrap_or(true);
+                    let certificate_visible =
+                        self.snapper_cert_visible(proposal_round, proposal_parents, transaction);
+
+                    dead || sibling_abandoned || !certificate_visible
+                }
+            };
+
+            if should_bottom {
+                self.snapper_state
+                    .apply_own_stance(object, SnapperObjectStance::Bottom)
+                    .expect("tx -> Bottom and none -> Bottom are legal Snapper transitions");
+                changes.push(SnapperObjectStanceVote {
+                    object,
+                    stance: SnapperObjectStance::Bottom,
+                });
+            }
+        }
+
+        // Phase 3: uncontested ACKs.
+        let objects = self.snapper_state.objects().collect::<Vec<_>>();
+        for object in objects {
+            if self.snapper_state.is_resolved(&object) || recovery.contains(&object) {
+                continue;
+            }
+
+            let candidates = self
+                .snapper_state
+                .candidates(&object)
+                .copied()
+                .collect::<Vec<_>>();
+            if candidates.len() != 1 {
+                continue;
+            }
+
+            let transaction = candidates[0];
+            if self.snapper_state.own_stance(&object).is_none() {
+                let stance = SnapperObjectStance::Transaction(transaction);
+                self.snapper_state
+                    .apply_own_stance(object, stance)
+                    .expect("none -> tx is a legal Snapper transition");
+                changes.push(SnapperObjectStanceVote { object, stance });
+            }
+        }
+
+        changes
+    }
+
+    /// FinalizeOnCommitTX + ResolveOnCommitObj for the owned-object
+    /// evaluation path.
+    fn resolve_snapper_committed_anchor(
+        &mut self,
+        anchor: BlockRef,
+        committed_blocks: &[VerifiedBlock],
+    ) -> Vec<(SnapperObjectKey, SnapperObjectDecision)> {
+        self.observe_snapper_blocks(committed_blocks);
+
+        let history = self.snapper_causal_history_refs(anchor);
+        self.process_snapper_blocks(&history);
+
+        let mut changed = self.snapper_try_fast_decisions();
+        let recovery = self.snapper_recovery_objects_at(anchor);
+
+        // FinalizeOnCommitTX: certified transactions outside recovery can be
+        // finalized directly from the committed anchor.
+        let transactions = self.snapper_state.transaction_ids().collect::<Vec<_>>();
+        for transaction in transactions {
+            if !self.snapper_state.can_commit_transaction(transaction)
+                || self.snapper_state.is_transaction_dead(transaction)
+                || !self.snapper_includes(anchor, transaction)
+                || !self.snapper_has_cert(anchor, transaction)
+            {
+                continue;
+            }
+
+            let Some(inputs) = self.snapper_state.owned_inputs(transaction) else {
+                continue;
+            };
+            if inputs.iter().any(|object| recovery.contains(object)) {
+                continue;
+            }
+
+            if let Ok(decisions) = self.snapper_state.commit_transaction(transaction) {
+                changed.extend(decisions);
+            }
+        }
+
+        // ResolveOnCommitObj: certificate branch has priority. Only if no
+        // viable transaction certificate is in the committed causal history
+        // may a skip/unlock certificate release the object.
+        for object in recovery {
+            if self.snapper_state.is_resolved(&object) {
+                continue;
+            }
+
+            let candidates = self.snapper_visible_candidates(anchor, &object);
+            let certified = candidates
+                .iter()
+                .copied()
+                .filter(|transaction| {
+                    self.snapper_state.can_commit_transaction(*transaction)
+                        && !self.snapper_state.is_transaction_dead(*transaction)
+                        && self.snapper_has_cert(anchor, *transaction)
+                })
+                .collect::<Vec<_>>();
+
+            if let Some(transaction) = certified.first().copied() {
+                debug_assert!(
+                    certified.len() == 1,
+                    "two conflicting transactions should not both have Snapper certificates"
+                );
+                if let Ok(decisions) = self.snapper_state.commit_transaction(transaction) {
+                    changed.extend(decisions);
+                }
+                continue;
+            }
+
+            if self.snapper_has_opposing_cert(anchor, &object)
+                && let Ok(decisions) = self.snapper_state.release_object(object)
+            {
+                changed.extend(decisions);
+            }
+        }
+
+        self.record_snapper_resolutions(
+            anchor.round,
+            SnapperResolutionPath::CommittedAnchor,
+            &changed,
+        );
+        changed
     }
 
     fn add_voted_blocks(&mut self, voted_blocks: Vec<(VerifiedBlock, Vec<TransactionIndex>)>) {
@@ -242,6 +1039,10 @@ impl VoteTrackerState {
             // Ignore the block and own votes, since they are outside of vote tracker GC bound.
             return;
         }
+
+        self.snapper_blocks
+            .entry(voted_block.reference())
+            .or_insert_with(|| voted_block.clone());
 
         // Count own reject votes against each peer authority.
         let peer_hostname = &self
@@ -292,6 +1093,8 @@ impl VoteTrackerState {
                 break;
             }
         }
+        self.snapper_processed_blocks
+            .retain(|block_ref| block_ref.round > self.gc_round);
 
         self.context
             .metrics
@@ -472,5 +1275,352 @@ mod test {
             .unwrap()
             .reject_txn_votes;
         assert!(reject_votes_2.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod snapper_protocol_tests {
+    use super::*;
+    use crate::{TestBlock, snapper::SNAPPER_OBJECT_ID_LENGTH};
+
+    fn object(tag: u8) -> SnapperObjectKey {
+        SnapperObjectKey {
+            object_id: [tag; SNAPPER_OBJECT_ID_LENGTH],
+            version: 0,
+        }
+    }
+
+    fn transaction(object: SnapperObjectKey, seed: u8) -> Transaction {
+        Transaction::new(SnapperTransactionEnvelope::new(vec![object], vec![seed; 16]).encode())
+    }
+
+    fn transaction_id(transaction: &Transaction) -> SnapperTransactionId {
+        SnapperTransactionEnvelope::transaction_id(transaction.data())
+    }
+
+    fn block(
+        round: Round,
+        author: u32,
+        parents: &[VerifiedBlock],
+        transactions: Vec<Transaction>,
+        stance_votes: Vec<SnapperObjectStanceVote>,
+    ) -> VerifiedBlock {
+        let mut builder = TestBlock::new(round, author).set_transactions(transactions);
+        if !parents.is_empty() {
+            builder =
+                builder.set_ancestors(parents.iter().map(|block| block.reference()).collect());
+        }
+        VerifiedBlock::new_for_test(
+            builder
+                .set_snapper_object_stance_votes(stance_votes)
+                .build(),
+        )
+    }
+
+    fn add_and_process(state: &mut VoteTrackerState, blocks: &[VerifiedBlock]) {
+        state.add_voted_blocks(blocks.iter().map(|block| (block.clone(), vec![])).collect());
+        let refs = blocks
+            .iter()
+            .map(|block| block.reference())
+            .collect::<Vec<_>>();
+        state.process_snapper_blocks(&refs);
+    }
+
+    #[test]
+    fn snapper_fast_commit_requires_quorum_of_certificate_blocks() {
+        let context = Arc::new(Context::new_for_test(4).0);
+        let mut state = VoteTrackerState::new(context);
+        let object = object(1);
+        let tx = transaction(object, 1);
+        let tx_id = transaction_id(&tx);
+
+        let r1 = vec![
+            block(1, 0, &[], vec![tx], vec![]),
+            block(1, 1, &[], vec![], vec![]),
+            block(1, 2, &[], vec![], vec![]),
+            block(1, 3, &[], vec![], vec![]),
+        ];
+
+        let ack = SnapperObjectStanceVote {
+            object,
+            stance: SnapperObjectStance::Transaction(tx_id),
+        };
+        let r2 = (0..4)
+            .map(|author| block(2, author, &r1, vec![], vec![ack]))
+            .collect::<Vec<_>>();
+        let r3 = (0..4)
+            .map(|author| block(3, author, &r2, vec![], vec![]))
+            .collect::<Vec<_>>();
+
+        let all = r1.iter().chain(&r2).chain(&r3).cloned().collect::<Vec<_>>();
+        add_and_process(&mut state, &all);
+
+        let decisions = state.snapper_try_fast_decisions();
+        assert_eq!(
+            state.snapper_state.decision(&object),
+            Some(SnapperObjectDecision::Commit(tx_id))
+        );
+        assert!(!decisions.is_empty());
+    }
+
+    #[test]
+    fn snapper_fast_skip_releases_object() {
+        let context = Arc::new(Context::new_for_test(4).0);
+        let mut state = VoteTrackerState::new(context);
+        let object = object(2);
+        let tx0 = transaction(object, 1);
+        let tx1 = transaction(object, 2);
+
+        let r1 = vec![
+            block(1, 0, &[], vec![tx0], vec![]),
+            block(1, 1, &[], vec![tx1], vec![]),
+            block(1, 2, &[], vec![], vec![]),
+            block(1, 3, &[], vec![], vec![]),
+        ];
+        let bottom = SnapperObjectStanceVote {
+            object,
+            stance: SnapperObjectStance::Bottom,
+        };
+        let r2 = (0..4)
+            .map(|author| block(2, author, &r1, vec![], vec![bottom]))
+            .collect::<Vec<_>>();
+        let r3 = (0..4)
+            .map(|author| block(3, author, &r2, vec![], vec![]))
+            .collect::<Vec<_>>();
+
+        let all = r1.iter().chain(&r2).chain(&r3).cloned().collect::<Vec<_>>();
+        add_and_process(&mut state, &all);
+
+        state.snapper_try_fast_decisions();
+        assert_eq!(
+            state.snapper_state.decision(&object),
+            Some(SnapperObjectDecision::Release)
+        );
+    }
+
+    #[test]
+    fn committed_anchor_prioritizes_hidden_tx_certificate_over_unlock_certificate() {
+        let context = Arc::new(Context::new_for_test(4).0);
+        let mut state = VoteTrackerState::new(context);
+        let object = object(3);
+        let tx0 = transaction(object, 1);
+        let tx1 = transaction(object, 2);
+        let tx0_id = transaction_id(&tx0);
+
+        let r1 = vec![
+            block(1, 0, &[], vec![tx0], vec![]),
+            block(1, 1, &[], vec![], vec![]),
+            block(1, 2, &[], vec![], vec![]),
+            block(1, 3, &[], vec![], vec![]),
+        ];
+
+        let ack = SnapperObjectStanceVote {
+            object,
+            stance: SnapperObjectStance::Transaction(tx0_id),
+        };
+        let bottom = SnapperObjectStanceVote {
+            object,
+            stance: SnapperObjectStance::Bottom,
+        };
+
+        let r2a = block(2, 0, &r1, vec![], vec![ack]);
+        let r2b = block(2, 1, &r1, vec![], vec![ack]);
+        let r2c = block(2, 2, &r1, vec![], vec![ack]);
+        let r2d = block(2, 3, &r1, vec![tx1], vec![bottom]);
+
+        // A3 sees only the three ACKing round-2 blocks and therefore forms a
+        // transaction certificate for tx0.
+        let r3a = block(
+            3,
+            0,
+            &[r2a.clone(), r2b.clone(), r2c.clone()],
+            vec![],
+            vec![],
+        );
+
+        // B3 and C3 saw the conflict after ACKing tx0, so Bottom is an unlock
+        // vote. D3 remains a skip vote.
+        let r3b = block(
+            3,
+            1,
+            &[r2b.clone(), r2c.clone(), r2d.clone()],
+            vec![],
+            vec![bottom],
+        );
+        let r3c = block(
+            3,
+            2,
+            &[r2c.clone(), r2b.clone(), r2d.clone()],
+            vec![],
+            vec![bottom],
+        );
+        let r3d = block(
+            3,
+            3,
+            &[r2d.clone(), r2b.clone(), r2c.clone()],
+            vec![],
+            vec![],
+        );
+
+        // U4 sees B3,C3,D3: two unlocks plus one skip form an unlock
+        // certificate, but U4 does not see A3's transaction certificate.
+        let r4u = block(
+            4,
+            3,
+            &[r3b.clone(), r3c.clone(), r3d.clone()],
+            vec![],
+            vec![],
+        );
+        let r4a = block(
+            4,
+            0,
+            &[r3a.clone(), r3b.clone(), r3c.clone()],
+            vec![],
+            vec![],
+        );
+        let r4b = block(
+            4,
+            1,
+            &[r3a.clone(), r3b.clone(), r3c.clone()],
+            vec![],
+            vec![],
+        );
+
+        let anchor = block(
+            5,
+            0,
+            &[r4a.clone(), r4b.clone(), r4u.clone()],
+            vec![],
+            vec![],
+        );
+
+        let all = r1
+            .iter()
+            .cloned()
+            .chain([r2a, r2b, r2c, r2d])
+            .chain([r3a.clone(), r3b, r3c, r3d])
+            .chain([r4u.clone(), r4a, r4b])
+            .chain([anchor.clone()])
+            .collect::<Vec<_>>();
+        add_and_process(&mut state, &all);
+
+        assert!(state.snapper_is_fast_cert(r3a.reference(), tx0_id));
+        assert!(state.snapper_is_unlock_cert(r4u.reference(), &object));
+
+        state.resolve_snapper_committed_anchor(anchor.reference(), &all);
+        assert_eq!(
+            state.snapper_state.decision(&object),
+            Some(SnapperObjectDecision::Commit(tx0_id))
+        );
+    }
+
+    #[test]
+    fn committed_anchor_releases_on_unlock_when_no_tx_certificate_exists() {
+        let context = Arc::new(Context::new_for_test(4).0);
+        let mut state = VoteTrackerState::new(context);
+        let object = object(4);
+        let tx0 = transaction(object, 1);
+        let tx1 = transaction(object, 2);
+        let tx0_id = transaction_id(&tx0);
+
+        let r1a = block(1, 0, &[], vec![tx0], vec![]);
+        let r1b = block(1, 1, &[], vec![], vec![]);
+        let r1c = block(1, 2, &[], vec![], vec![]);
+        let r1d = block(1, 3, &[], vec![tx1], vec![]);
+
+        let ack = SnapperObjectStanceVote {
+            object,
+            stance: SnapperObjectStance::Transaction(tx0_id),
+        };
+        let bottom = SnapperObjectStanceVote {
+            object,
+            stance: SnapperObjectStance::Bottom,
+        };
+
+        let r2a = block(
+            2,
+            0,
+            &[r1a.clone(), r1b.clone(), r1c.clone()],
+            vec![],
+            vec![ack],
+        );
+        let r2b = block(
+            2,
+            1,
+            &[r1a.clone(), r1b.clone(), r1c.clone()],
+            vec![],
+            vec![ack],
+        );
+        let r2c = block(
+            2,
+            2,
+            &[r1a.clone(), r1c.clone(), r1d.clone()],
+            vec![],
+            vec![bottom],
+        );
+        let r2d = block(
+            2,
+            3,
+            &[r1a.clone(), r1c.clone(), r1d.clone()],
+            vec![],
+            vec![bottom],
+        );
+
+        let r3a = block(
+            3,
+            0,
+            &[r2a.clone(), r2c.clone(), r2d.clone()],
+            vec![],
+            vec![bottom],
+        );
+        let r3b = block(
+            3,
+            1,
+            &[r2b.clone(), r2c.clone(), r2d.clone()],
+            vec![],
+            vec![bottom],
+        );
+        let r3c = block(
+            3,
+            2,
+            &[r2a.clone(), r2c.clone(), r2d.clone()],
+            vec![],
+            vec![],
+        );
+
+        let unlock_cert = block(
+            4,
+            0,
+            &[r3a.clone(), r3b.clone(), r3c.clone()],
+            vec![],
+            vec![],
+        );
+        let anchor = block(5, 0, &[unlock_cert.clone()], vec![], vec![]);
+
+        let all = [
+            r1a,
+            r1b,
+            r1c,
+            r1d,
+            r2a,
+            r2b,
+            r2c,
+            r2d,
+            r3a,
+            r3b,
+            r3c,
+            unlock_cert.clone(),
+            anchor.clone(),
+        ];
+        add_and_process(&mut state, &all);
+
+        assert!(state.snapper_is_unlock_cert(unlock_cert.reference(), &object));
+        assert!(!state.snapper_has_cert(anchor.reference(), tx0_id));
+
+        state.resolve_snapper_committed_anchor(anchor.reference(), &all);
+        assert_eq!(
+            state.snapper_state.decision(&object),
+            Some(SnapperObjectDecision::Release)
+        );
     }
 }

@@ -35,6 +35,7 @@ mod peers_pool;
 mod proposer;
 mod round_prober;
 mod round_tracker;
+pub mod snapper;
 mod stake_aggregator;
 pub mod storage;
 mod subscriber;
@@ -46,6 +47,8 @@ mod universal_committer;
 
 /// Consensus test utilities.
 mod commit_test_fixture;
+#[cfg(test)]
+mod evaluation;
 #[cfg(test)]
 mod test_dag;
 mod test_dag_builder;

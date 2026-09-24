@@ -780,6 +780,13 @@ impl ConsensusOutputQuarantine {
             self.owned_object_locks.remove(obj_ref);
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn release_owned_object_locks_for_testing(&mut self, object_refs: &[ObjectRef]) {
+        for object_ref in object_refs {
+            self.owned_object_locks.remove(object_ref);
+        }
+    }
 }
 
 // Read methods - all methods in this block return data from the quarantine which would otherwise

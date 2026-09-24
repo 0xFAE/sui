@@ -1972,6 +1972,32 @@ impl AuthorityPerEpochStore {
             .get_owned_object_locks(&tables, obj_refs)
     }
 
+    /// Evaluation-only bridge used to measure when a Snapper `Release`
+    /// decision makes an owned-object version usable again.
+    ///
+    /// Production Snapper/Sui integration will eventually invoke equivalent
+    /// logic from the real decision-delivery path. Keeping this test-only for
+    /// now prevents the benchmark bridge from changing production behavior.
+    #[cfg(test)]
+    pub(crate) fn release_owned_object_locks_for_testing(
+        &self,
+        object_refs: &[ObjectRef],
+    ) -> SuiResult<()> {
+        if object_refs.is_empty() {
+            return Ok(());
+        }
+
+        self.consensus_quarantine
+            .write()
+            .release_owned_object_locks_for_testing(object_refs);
+
+        let tables = self.tables()?;
+        let mut batch = self.db_batch()?;
+        batch.delete_batch(&tables.owned_object_locked_transactions, object_refs)?;
+        batch.write()?;
+        Ok(())
+    }
+
     /// Attempts to acquire owned object locks for a transaction post-consensus.
     ///
     /// Checks whether the object versions are already locked by searching:
